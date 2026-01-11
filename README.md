@@ -28,6 +28,17 @@ python bin/00_build_raw_from_hf.py \
   --fineweb2_hq_config en
 ```
 
+FineWeb-HQ only:
+
+```
+python bin/00_build_raw_from_hf.py \
+  --out data/raw_fineweb_hq.txt \
+  --target_lines 300000 \
+  --weights comma=0.0,fineweb_edu=0.0,fineweb_hq=1.0,fineweb2_hq=0.0
+```
+
+Note: FineWeb-HQ can have intermittent shard loading failures; the builder logs and skips failing samples.
+
 ## Pipeline
 
 ```

@@ -8,7 +8,7 @@ from tools.encoder import ByteEncoder
 from tools.planner import Planner
 from tools.renderer import Renderer
 from tools.rvq import load_rvq
-from utils import split_sentences
+from utils import setup_runtime, split_sentences
 
 
 def sample_lengths(len_logits):
@@ -61,7 +61,11 @@ def render_sentence(renderer, codes, resid, sample: bool, temperature: float):
 
 
 def main(args):
-    device = torch.device(args.device)
+    logger, device = setup_runtime(
+        "09_chat",
+        device=args.device,
+        threads=args.threads,
+    )
 
     enc_ckpt = torch.load(args.encoder, map_location=device)
     encoder = ByteEncoder(**enc_ckpt["config"])
@@ -83,6 +87,7 @@ def main(args):
     renderer.to(device)
     renderer.eval()
 
+    logger.info("chat ready")
     print("SentCodeLM chat. Empty line to exit.")
     while True:
         prompt = input("prompt> ").strip()
@@ -128,5 +133,6 @@ if __name__ == "__main__":
     ap.add_argument("--sample", action="store_true")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()
     main(args)

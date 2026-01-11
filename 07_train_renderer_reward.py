@@ -23,7 +23,7 @@ from tools.reward import (
     utf8_invalid_penalty,
 )
 from tools.rvq import load_rvq
-from utils import ensure_dir, set_seed
+from utils import ensure_dir, setup_runtime
 
 
 def sample_lengths(len_logits):
@@ -83,19 +83,29 @@ def decode_batch(tokens, lengths):
 
 
 def main(args):
-    set_seed(args.seed)
+    logger, device = setup_runtime(
+        "07_train_renderer_reward",
+        device=args.device,
+        threads=args.threads,
+        seed=args.seed,
+    )
     ensure_dir(args.out_dir)
-    device = torch.device(args.device)
 
     rvq = load_rvq(args.rvq, device=device)
     pack = torch.load(args.train_data, map_location="cpu")
     train_ds = RendererDataset(pack["renderer"])
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = min(8, max(1, args.threads // 2))
+    pin_memory = device.type == "cuda"
     loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=lambda b: collate_renderer(b, max_len=args.max_len),
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
 
     enc_ckpt = torch.load(args.encoder, map_location=device)
@@ -124,9 +134,9 @@ def main(args):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         for codes, resid, tgt_emb, _, _ in pbar:
-            codes = codes.to(device)
-            resid = resid.to(device)
-            tgt_emb = tgt_emb.to(device)
+            codes = codes.to(device, non_blocking=True)
+            resid = resid.to(device, non_blocking=True)
+            tgt_emb = tgt_emb.to(device, non_blocking=True)
 
             logits, len_logits = model(codes, resid, ctx=None)
 
@@ -140,8 +150,12 @@ def main(args):
             greedy_tokens_list = decode_batch(greedy_tokens_ids, greedy_len)
 
             with torch.no_grad():
-                samp_ids = build_encoder_inputs(samp_tokens_list, max_len=args.max_bytes).to(device)
-                greedy_ids = build_encoder_inputs(greedy_tokens_list, max_len=args.max_bytes).to(device)
+                samp_ids = build_encoder_inputs(samp_tokens_list, max_len=args.max_bytes).to(
+                    device, non_blocking=True
+                )
+                greedy_ids = build_encoder_inputs(greedy_tokens_list, max_len=args.max_bytes).to(
+                    device, non_blocking=True
+                )
                 samp_emb = encoder(samp_ids)
                 greedy_emb = encoder(greedy_ids)
 
@@ -198,7 +212,7 @@ def main(args):
     }
     out_path = Path(args.out_dir) / "renderer.pt"
     torch.save(ckpt, str(out_path))
-    print(f"saved={out_path}")
+    logger.info("saved=%s", out_path)
 
 
 if __name__ == "__main__":
@@ -225,5 +239,7 @@ if __name__ == "__main__":
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--num_workers", type=int, default=None)
     args = ap.parse_args()
     main(args)

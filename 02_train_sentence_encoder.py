@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from tools.data import BYTE_PAD, text_to_bytes
 from tools.encoder import ByteEncoder
-from utils import ensure_dir, read_jsonl, set_seed, simple_train_val_split
+from utils import ensure_dir, read_jsonl, setup_runtime, simple_train_val_split
 
 
 class PairDataset(Dataset):
@@ -63,32 +63,50 @@ def info_nce_loss(ctx_emb, tgt_emb, tau: float):
 
 
 def main(args):
-    set_seed(args.seed)
+    logger, device = setup_runtime(
+        "02_train_sentence_encoder",
+        device=args.device,
+        threads=args.threads,
+        seed=args.seed,
+    )
     ensure_dir(args.out_dir)
-    device = torch.device(args.device)
 
     sentences = read_jsonl(str(Path(args.data_dir) / "sentences.jsonl"))
     sequences = read_jsonl(str(Path(args.data_dir) / "sequences.jsonl"))
 
     pairs = build_pairs(sentences, sequences, window=args.context_window)
     train_pairs, val_pairs = simple_train_val_split(pairs, args.val_frac, args.seed)
+    logger.info(
+        "pairs=%d train=%d val=%d",
+        len(pairs),
+        len(train_pairs),
+        len(val_pairs),
+    )
 
     train_ds = PairDataset(train_pairs, args.max_bytes)
     val_ds = PairDataset(val_pairs, args.max_bytes)
 
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = min(8, max(1, args.threads // 2))
+    pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=lambda b: collate_pairs(b, args.max_bytes),
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=lambda b: collate_pairs(b, args.max_bytes),
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
 
     model = ByteEncoder(
@@ -107,8 +125,8 @@ def main(args):
     for epoch in range(args.epochs):
         pbar = tqdm(train_loader, desc=f"epoch {epoch}")
         for ctx_ids, nxt_ids in pbar:
-            ctx_ids = ctx_ids.to(device)
-            nxt_ids = nxt_ids.to(device)
+            ctx_ids = ctx_ids.to(device, non_blocking=True)
+            nxt_ids = nxt_ids.to(device, non_blocking=True)
             ctx_emb = model(ctx_ids)
             nxt_emb = model(nxt_ids)
             loss = info_nce_loss(ctx_emb, nxt_emb, args.tau)
@@ -117,20 +135,20 @@ def main(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             step += 1
-            pbar.set_postfix(loss=float(loss))
+            pbar.set_postfix(loss=float(loss.detach()))
 
         if val_pairs:
             model.eval()
             losses = []
             with torch.no_grad():
                 for ctx_ids, nxt_ids in val_loader:
-                    ctx_ids = ctx_ids.to(device)
-                    nxt_ids = nxt_ids.to(device)
+                    ctx_ids = ctx_ids.to(device, non_blocking=True)
+                    nxt_ids = nxt_ids.to(device, non_blocking=True)
                     ctx_emb = model(ctx_ids)
                     nxt_emb = model(nxt_ids)
                     vloss = info_nce_loss(ctx_emb, nxt_emb, args.tau)
-                    losses.append(float(vloss))
-            print(f"val_loss={sum(losses)/max(1,len(losses)):.4f}")
+                    losses.append(float(vloss.detach()))
+            logger.info("val_loss=%.4f", sum(losses) / max(1, len(losses)))
             model.train()
 
     ckpt = {
@@ -145,7 +163,7 @@ def main(args):
         },
     }
     torch.save(ckpt, str(Path(args.out_dir) / "enc.pt"))
-    print(f"saved={Path(args.out_dir) / 'enc.pt'}")
+    logger.info("saved=%s", Path(args.out_dir) / "enc.pt")
 
 
 if __name__ == "__main__":
@@ -167,5 +185,7 @@ if __name__ == "__main__":
     ap.add_argument("--val_frac", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--num_workers", type=int, default=None)
     args = ap.parse_args()
     main(args)

@@ -5,7 +5,7 @@ requires-python = ">=3.10"
 dependencies = [
   "datasets",
   "torch",
-  "numpy",
+  "numpy<2",
   "tqdm",
   "regex",
   "pyyaml",
@@ -13,3 +13,11 @@ dependencies = [
   "zstandard",
   "xxhash",
 ]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["tools"]
+py-modules = ["utils"]

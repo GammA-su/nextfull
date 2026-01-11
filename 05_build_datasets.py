@@ -5,11 +5,15 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from utils import ensure_dir, read_jsonl, set_seed
+from utils import ensure_dir, read_jsonl, setup_runtime
 
 
 def main(args):
-    set_seed(args.seed)
+    logger, _ = setup_runtime(
+        "05_build_datasets",
+        threads=args.threads,
+        seed=args.seed,
+    )
     ensure_dir(args.out_dir)
 
     sentences = read_jsonl(str(Path(args.data_dir) / "sentences.jsonl"))
@@ -62,8 +66,16 @@ def main(args):
 
     torch.save(train, str(Path(args.out_dir) / "packed_train.pt"))
     torch.save(val, str(Path(args.out_dir) / "packed_val.pt"))
-    print(f"train_planner={len(train['planner'])} train_renderer={len(train['renderer'])}")
-    print(f"val_planner={len(val['planner'])} val_renderer={len(val['renderer'])}")
+    logger.info(
+        "train_planner=%d train_renderer=%d",
+        len(train["planner"]),
+        len(train["renderer"]),
+    )
+    logger.info(
+        "val_planner=%d val_renderer=%d",
+        len(val["planner"]),
+        len(val["renderer"]),
+    )
 
 
 if __name__ == "__main__":
@@ -72,5 +84,6 @@ if __name__ == "__main__":
     ap.add_argument("--out_dir", default="data")
     ap.add_argument("--val_frac", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()
     main(args)

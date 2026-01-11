@@ -1,0 +1,14 @@
+.venv/
+.venv310/
+.cache/
+__pycache__/
+bin/__pycache__/
+tools/__pycache__/
+sentcodelm.egg-info/
+data/
+out/
+*.pyc
+*.pt
+*.npy
+*.npz
+*.jsonl

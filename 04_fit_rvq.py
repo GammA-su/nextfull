@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from tools.rvq import RVQ
-from utils import ensure_dir, set_seed
+from utils import ensure_dir, setup_runtime
 
 
 class EmbDataset(Dataset):
@@ -22,16 +22,31 @@ class EmbDataset(Dataset):
 
 
 def main(args):
-    set_seed(args.seed)
+    logger, device = setup_runtime(
+        "04_fit_rvq",
+        device=args.device,
+        threads=args.threads,
+        seed=args.seed,
+    )
     ensure_dir(args.out_dir)
-    device = torch.device(args.device)
 
     emb = np.load(args.emb)
     if emb.shape[1] != args.code_dim:
         raise ValueError(f"emb dim {emb.shape[1]} != code_dim {args.code_dim}")
 
     ds = EmbDataset(emb.astype(np.float32))
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = min(8, max(1, args.threads // 2))
+    pin_memory = device.type == "cuda"
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+    )
 
     rvq = RVQ(
         K=args.K,
@@ -45,7 +60,7 @@ def main(args):
     for epoch in range(args.epochs):
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         for batch in pbar:
-            x = batch.to(device)
+            x = batch.to(device, non_blocking=True)
             rvq.update(x)
         usage = []
         for k in range(rvq.K):
@@ -53,7 +68,7 @@ def main(args):
             probs = counts / counts.sum()
             entropy = -(probs * np.log(probs + 1e-8)).sum()
             usage.append(entropy)
-        print(f"usage_entropy={['%.2f' % u for u in usage]}")
+        logger.info("usage_entropy=%s", [f"{u:.2f}" for u in usage])
 
     ckpt = {
         "model": rvq.state_dict(),
@@ -67,7 +82,7 @@ def main(args):
     }
     out_path = Path(args.out_dir) / "rvq.pt"
     torch.save(ckpt, str(out_path))
-    print(f"saved={out_path}")
+    logger.info("saved=%s", out_path)
 
 
 if __name__ == "__main__":
@@ -83,6 +98,8 @@ if __name__ == "__main__":
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--num_workers", type=int, default=None)
     args = ap.parse_args()
     if len(args.V) != args.K:
         raise ValueError("V must have K entries")

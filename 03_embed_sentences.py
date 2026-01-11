@@ -7,15 +7,20 @@ from tqdm import tqdm
 
 from tools.data import BYTE_PAD, text_to_bytes
 from tools.encoder import ByteEncoder
-from utils import ensure_dir, read_jsonl, write_jsonl
+from utils import ensure_dir, read_jsonl, setup_runtime, write_jsonl
 
 
 def main(args):
+    logger, device = setup_runtime(
+        "03_embed_sentences",
+        device=args.device,
+        threads=args.threads,
+    )
     ensure_dir(args.out_dir)
-    device = torch.device(args.device)
 
     sentences = read_jsonl(str(Path(args.data_dir) / "sentences.jsonl"))
     sentences = sorted(sentences, key=lambda x: x["sid"])
+    logger.info("sentences=%d", len(sentences))
 
     ckpt = torch.load(args.encoder, map_location=device)
     model = ByteEncoder(**ckpt["config"])
@@ -44,11 +49,11 @@ def main(args):
     emb_mat = np.concatenate(all_emb, axis=0)
     np.save(str(Path(args.out_dir) / "sent_emb.npy"), emb_mat)
     write_jsonl(str(Path(args.out_dir) / "sent_meta.jsonl"), meta)
-    print(f"saved={Path(args.out_dir) / 'sent_emb.npy'}")
+    logger.info("saved=%s", Path(args.out_dir) / "sent_emb.npy")
 
 
 def run_batch(model, batch, device):
-    with torch.no_grad():
+    with torch.inference_mode():
         ids = torch.tensor(batch, dtype=torch.long, device=device)
         emb = model(ids).cpu().numpy()
     return emb
@@ -62,5 +67,6 @@ if __name__ == "__main__":
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--max_bytes", type=int, default=256)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()
     main(args)

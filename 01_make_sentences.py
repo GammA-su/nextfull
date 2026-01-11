@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from utils import ensure_dir, split_sentences, write_jsonl
+from utils import ensure_dir, setup_runtime, split_sentences, write_jsonl
 
 
 def main(raw_path: str, out_dir: str, max_sents: int):
@@ -28,7 +28,7 @@ def main(raw_path: str, out_dir: str, max_sents: int):
 
     write_jsonl(str(Path(out_dir) / "sentences.jsonl"), sentences)
     write_jsonl(str(Path(out_dir) / "sequences.jsonl"), sequences)
-    print(f"sentences={len(sentences)} sequences={len(sequences)} out={out_dir}")
+    return len(sentences), len(sequences)
 
 
 if __name__ == "__main__":
@@ -36,5 +36,9 @@ if __name__ == "__main__":
     ap.add_argument("--raw", required=True, help="Path to data/raw.txt")
     ap.add_argument("--out_dir", default="data", help="Output directory")
     ap.add_argument("--max_sents", type=int, default=128, help="Max sentences per doc")
+    ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()
-    main(args.raw, args.out_dir, args.max_sents)
+    logger, _ = setup_runtime("01_make_sentences", threads=args.threads)
+    logger.info("loading raw=%s", args.raw)
+    sent_count, seq_count = main(args.raw, args.out_dir, args.max_sents)
+    logger.info("sentences=%d sequences=%d out=%s", sent_count, seq_count, args.out_dir)

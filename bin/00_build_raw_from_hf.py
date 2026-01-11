@@ -1,6 +1,5 @@
 import argparse
 import html
-import random
 import re
 import sys
 from collections import defaultdict
@@ -9,11 +8,15 @@ from pathlib import Path
 import xxhash
 from datasets import get_dataset_config_names, load_dataset
 
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from utils import setup_runtime
+
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
 SENT_END_RE = re.compile(r"[.!?]")
 
-SOURCES = ["comma", "fineweb_edu", "fineweb2_hq"]
+SOURCES = ["comma", "fineweb_edu", "fineweb_hq", "fineweb2_hq"]
 
 
 def normalize_text(text: str) -> str:
@@ -85,7 +88,7 @@ def build_schedule(weights, scale: int = 100):
     return schedule
 
 
-def load_source(name: str, args):
+def load_source(name: str, args, logger):
     if name == "comma":
         ds = load_dataset(
             "common-pile/comma_v0.1_training_dataset",
@@ -99,12 +102,18 @@ def load_source(name: str, args):
             split="train",
             streaming=True,
         )
+    elif name == "fineweb_hq":
+        ds = load_dataset(
+            "epfml/FineWeb-HQ",
+            split="train",
+            streaming=True,
+        )
     elif name == "fineweb2_hq":
         if not args.fineweb2_hq_config:
             configs = get_dataset_config_names("epfml/FineWeb2-HQ")
-            print("FineWeb2-HQ configs:")
+            logger.error("FineWeb2-HQ configs:")
             for cfg in configs:
-                print(f"  {cfg}")
+                logger.error("  %s", cfg)
             sys.exit(1)
         ds = load_dataset(
             "epfml/FineWeb2-HQ",
@@ -117,18 +126,21 @@ def load_source(name: str, args):
     return iter(ds)
 
 
-def log_progress(written, per_source, dupe_count, filtered_count):
+def log_progress(logger, written, per_source, dupe_count, filtered_count):
     denom = max(1, dupe_count + written)
     dedupe_rate = dupe_count / float(denom)
     counts = ", ".join(f"{k}={per_source.get(k,0)}" for k in SOURCES)
-    print(
-        f"written={written} dedupe_rate={dedupe_rate:.3f} filtered={filtered_count} {counts}",
-        file=sys.stderr,
+    logger.info(
+        "written=%d dedupe_rate=%.3f filtered=%d %s",
+        written,
+        dedupe_rate,
+        filtered_count,
+        counts,
     )
 
 
 def main(args):
-    random.seed(args.seed)
+    logger, _ = setup_runtime("00_build_raw_from_hf", threads=args.threads, seed=args.seed)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +151,7 @@ def main(args):
     active = {}
     for name in SOURCES:
         if weights.get(name, 0.0) > 0:
-            active[name] = load_source(name, args)
+            active[name] = load_source(name, args, logger)
 
     if not active:
         raise ValueError("no active sources; check weights")
@@ -164,12 +176,12 @@ def main(args):
                     try:
                         sample = next(active[name])
                     except StopIteration:
-                        print(f"source_exhausted={name}", file=sys.stderr)
+                        logger.info("source_exhausted=%s", name)
                         active.pop(name, None)
                         break
                     except Exception as exc:
                         errors[name] += 1
-                        print(f"warn: {name} read error: {exc}", file=sys.stderr)
+                        logger.warning("read_error source=%s error=%s", name, exc)
                         continue
 
                     raw = pick_text(sample)
@@ -205,13 +217,13 @@ def main(args):
                 per_source[name] += 1
 
                 if written % args.log_every == 0:
-                    log_progress(written, per_source, dupe_count, filtered_count)
+                    log_progress(logger, written, per_source, dupe_count, filtered_count)
 
-    log_progress(written, per_source, dupe_count, filtered_count)
+    log_progress(logger, written, per_source, dupe_count, filtered_count)
     if errors:
         err_counts = ", ".join(f"{k}={v}" for k, v in errors.items() if v)
         if err_counts:
-            print(f"read_errors: {err_counts}", file=sys.stderr)
+            logger.warning("read_errors: %s", err_counts)
 
 
 if __name__ == "__main__":
@@ -229,5 +241,6 @@ if __name__ == "__main__":
     ap.add_argument("--alnum_ratio", type=float, default=0.6)
     ap.add_argument("--log_every", type=int, default=10000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()
     main(args)

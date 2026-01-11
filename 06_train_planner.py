@@ -9,7 +9,7 @@ from tqdm import tqdm
 from tools.data import PlannerSequenceDataset, collate_planner
 from tools.planner import Planner
 from tools.rvq import load_rvq
-from utils import ensure_dir, set_seed
+from utils import ensure_dir, setup_runtime
 
 
 def masked_ce(logits, targets, mask):
@@ -26,9 +26,13 @@ def info_nce(pred, target, tau: float):
 
 
 def main(args):
-    set_seed(args.seed)
+    logger, device = setup_runtime(
+        "06_train_planner",
+        device=args.device,
+        threads=args.threads,
+        seed=args.seed,
+    )
     ensure_dir(args.out_dir)
-    device = torch.device(args.device)
 
     rvq = load_rvq(args.rvq, device=device)
 
@@ -38,19 +42,27 @@ def main(args):
     train_ds = PlannerSequenceDataset(train_pack["planner"])
     val_ds = PlannerSequenceDataset(val_pack["planner"])
 
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = min(8, max(1, args.threads // 2))
+    pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=lambda b: collate_planner(b, max_steps=args.max_steps),
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=lambda b: collate_planner(b, max_steps=args.max_steps),
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
     )
 
     d_resid = train_pack["planner"][0]["resid"].shape[1]
@@ -71,10 +83,10 @@ def main(args):
         model.train()
         pbar = tqdm(train_loader, desc=f"epoch {epoch}")
         for codes, resid, emb, lengths in pbar:
-            codes = codes.to(device)
-            resid = resid.to(device)
-            emb = emb.to(device)
-            lengths = lengths.to(device)
+            codes = codes.to(device, non_blocking=True)
+            resid = resid.to(device, non_blocking=True)
+            emb = emb.to(device, non_blocking=True)
+            lengths = lengths.to(device, non_blocking=True)
 
             code_logits, pred_resid, _ = model(codes, resid, lengths=lengths)
             mask = (
@@ -113,10 +125,10 @@ def main(args):
             losses = []
             with torch.no_grad():
                 for codes, resid, emb, lengths in val_loader:
-                    codes = codes.to(device)
-                    resid = resid.to(device)
-                    emb = emb.to(device)
-                    lengths = lengths.to(device)
+                    codes = codes.to(device, non_blocking=True)
+                    resid = resid.to(device, non_blocking=True)
+                    emb = emb.to(device, non_blocking=True)
+                    lengths = lengths.to(device, non_blocking=True)
                     code_logits, pred_resid, _ = model(codes, resid, lengths=lengths)
                     mask = (
                         torch.arange(codes.size(1) - 1, device=device).unsqueeze(0)
@@ -138,7 +150,7 @@ def main(args):
                     else:
                         nce_loss = torch.tensor(0.0, device=device)
                     losses.append(float(code_loss + args.lambda_nce * nce_loss))
-            print(f"val_loss={sum(losses)/max(1,len(losses)):.4f}")
+            logger.info("val_loss=%.4f", sum(losses) / max(1, len(losses)))
 
     ckpt = {
         "model": model.state_dict(),
@@ -155,7 +167,7 @@ def main(args):
     }
     out_path = Path(args.out_dir) / "planner.pt"
     torch.save(ckpt, str(out_path))
-    print(f"saved={out_path}")
+    logger.info("saved=%s", out_path)
 
 
 if __name__ == "__main__":
@@ -177,5 +189,7 @@ if __name__ == "__main__":
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--num_workers", type=int, default=None)
     args = ap.parse_args()
     main(args)
