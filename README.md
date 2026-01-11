@@ -16,6 +16,18 @@ uv pip install -e .
 
 Create `data/raw.txt` with one document per line.
 
+## Path B: Build raw.txt from Hugging Face
+
+```
+python bin/00_list_hf_configs.py --dataset epfml/FineWeb2-HQ
+python bin/00_build_raw_from_hf.py \
+  --out data/raw.txt \
+  --target_lines 300000 \
+  --weights comma=0.6,fineweb_edu=0.3,fineweb2_hq=0.1 \
+  --fineweb_edu_name sample-10BT \
+  --fineweb2_hq_config en
+```
+
 ## Pipeline
 
 ```
