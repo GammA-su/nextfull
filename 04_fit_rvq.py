@@ -1,4 +1,5 @@
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -59,9 +60,25 @@ def main(args):
 
     for epoch in range(args.epochs):
         pbar = tqdm(loader, desc=f"epoch {epoch}")
-        for batch in pbar:
+        start = time.time()
+        last_log = start
+        for step, batch in enumerate(pbar, start=1):
             x = batch.to(device, non_blocking=True)
             rvq.update(x)
+            if args.log_every > 0 and step % args.log_every == 0:
+                now = time.time()
+                step_time = now - last_log
+                avg_time = (now - start) / step
+                rate = (args.log_every / step_time) if step_time > 0 else 0.0
+                logger.info(
+                    "epoch=%d step=%d/%d rate=%.2f steps/s avg_step=%.4fs",
+                    epoch,
+                    step,
+                    len(loader),
+                    rate,
+                    avg_time,
+                )
+                last_log = now
         usage = []
         for k in range(rvq.K):
             counts = rvq.ema_counts[k].detach().cpu().numpy()
@@ -96,6 +113,7 @@ if __name__ == "__main__":
     ap.add_argument("--usage_balance_w", type=float, default=1.0)
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--log_every", type=int, default=100)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=16)

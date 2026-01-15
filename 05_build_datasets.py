@@ -1,5 +1,6 @@
 import argparse
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -42,7 +43,11 @@ def main(args):
     train = {"planner": [], "renderer": []}
     val = {"planner": [], "renderer": []}
 
-    for seq in sequences:
+    total = len(sequences)
+    logger.info("sequences=%d val_frac=%.3f", total, args.val_frac)
+    start = time.time()
+    last_log = start
+    for idx, seq in enumerate(sequences, start=1):
         sids = seq["sids"]
         if len(sids) < 2:
             continue
@@ -63,6 +68,19 @@ def main(args):
                     "text": sent_text[sid],
                 }
             )
+        if args.log_every > 0 and idx % args.log_every == 0:
+            now = time.time()
+            step = now - last_log
+            rate = (args.log_every / step) if step > 0 else 0.0
+            pct = 100.0 * idx / total if total else 0.0
+            logger.info(
+                "progress: %d/%d (%.2f%%) rate=%.1f seq/s",
+                idx,
+                total,
+                pct,
+                rate,
+            )
+            last_log = now
 
     torch.save(train, str(Path(args.out_dir) / "packed_train.pt"))
     torch.save(val, str(Path(args.out_dir) / "packed_val.pt"))
@@ -83,6 +101,7 @@ if __name__ == "__main__":
     ap.add_argument("--data_dir", default="data")
     ap.add_argument("--out_dir", default="data")
     ap.add_argument("--val_frac", type=float, default=0.05)
+    ap.add_argument("--log_every", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()

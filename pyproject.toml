@@ -1,7 +1,7 @@
 [project]
 name = "sentcodelm"
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
   "datasets",
   "torch",
@@ -12,6 +12,7 @@ dependencies = [
   "pyarrow",
   "zstandard",
   "xxhash",
+  "faiss-gpu",
 ]
 
 [build-system]

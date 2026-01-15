@@ -1,4 +1,5 @@
 import argparse
+import time
 from pathlib import Path
 
 import torch
@@ -80,9 +81,21 @@ def main(args):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     for epoch in range(args.epochs):
+        logger.info(
+            "epoch=%d train_batches=%d val_batches=%d batch_size=%d",
+            epoch,
+            len(train_loader),
+            len(val_loader),
+            args.batch_size,
+        )
         model.train()
         pbar = tqdm(train_loader, desc=f"epoch {epoch}")
-        for codes, resid, emb, lengths in pbar:
+        start = time.time()
+        last_log = start
+        running_loss = 0.0
+        running_code = 0.0
+        running_nce = 0.0
+        for step, (codes, resid, emb, lengths) in enumerate(pbar, start=1):
             codes = codes.to(device, non_blocking=True)
             resid = resid.to(device, non_blocking=True)
             emb = emb.to(device, non_blocking=True)
@@ -119,6 +132,27 @@ def main(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             pbar.set_postfix(loss=float(loss), code=float(code_loss), nce=float(nce_loss))
+            running_loss += float(loss)
+            running_code += float(code_loss)
+            running_nce += float(nce_loss)
+            if args.log_every > 0 and step % args.log_every == 0:
+                now = time.time()
+                step_time = now - last_log
+                rate = (args.log_every / step_time) if step_time > 0 else 0.0
+                logger.info(
+                    "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f code=%.4f nce=%.4f",
+                    epoch,
+                    step,
+                    len(train_loader),
+                    rate,
+                    running_loss / args.log_every,
+                    running_code / args.log_every,
+                    running_nce / args.log_every,
+                )
+                running_loss = 0.0
+                running_code = 0.0
+                running_nce = 0.0
+                last_log = now
 
         if len(val_ds) > 0:
             model.eval()
@@ -183,6 +217,7 @@ if __name__ == "__main__":
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--log_every", type=int, default=200)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--tau", type=float, default=0.07)
     ap.add_argument("--lambda_nce", type=float, default=1.0)

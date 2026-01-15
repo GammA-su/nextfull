@@ -178,7 +178,7 @@ if __name__ == "__main__":
     ap.add_argument("--n_heads", type=int, default=8)
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--tau", type=float, default=0.07)
     ap.add_argument("--grad_clip", type=float, default=1.0)

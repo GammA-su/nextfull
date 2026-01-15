@@ -1,4 +1,5 @@
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +66,11 @@ def main(args):
     codes_out = []
     resid_out = []
     bs = args.batch_size
+    total = emb.shape[0]
+    logger.info("encode: total=%d batch_size=%d log_every=%d", total, bs, args.log_every)
+    start = time.time()
+    last_log = start
+    next_log = args.log_every if args.log_every > 0 else None
     for i in tqdm(range(0, emb.shape[0], bs), desc="encode"):
         batch_np = emb[i : i + bs]
         if use_faiss:
@@ -77,6 +83,27 @@ def main(args):
                 codes, _, resid = rvq.encode(batch)
             codes_out.append(codes.cpu().numpy().astype(np.int32))
             resid_out.append(resid.cpu().numpy().astype(np.float32))
+        if next_log is not None:
+            processed = min(i + bs, total)
+            if processed >= next_log:
+                now = time.time()
+                elapsed = now - start
+                step = now - last_log
+                rate = (args.log_every / step) if step > 0 else 0.0
+                avg_rate = (processed / elapsed) if elapsed > 0 else 0.0
+                remaining = total - processed
+                eta = (remaining / avg_rate) if avg_rate > 0 else 0.0
+                logger.info(
+                    "progress: %d/%d (%.2f%%) rate=%.1f/s avg=%.1f/s eta=%.1fs",
+                    processed,
+                    total,
+                    100.0 * processed / total if total else 0.0,
+                    rate,
+                    avg_rate,
+                    eta,
+                )
+                last_log = now
+                next_log += args.log_every
 
     codes_mat = np.concatenate(codes_out, axis=0)
     resid_mat = np.concatenate(resid_out, axis=0)
@@ -95,5 +122,6 @@ if __name__ == "__main__":
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--no_faiss", action="store_true")
+    ap.add_argument("--log_every", type=int, default=100000)
     args = ap.parse_args()
     main(args)
