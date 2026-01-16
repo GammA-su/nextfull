@@ -133,11 +133,24 @@ def main(args):
             global_step = start_epoch * len(train_loader) + start_step
         rng_state = ckpt.get("rng_state")
         if rng_state is not None:
-            torch.set_rng_state(rng_state)
+            try:
+                if torch.is_tensor(rng_state):
+                    rng_state = rng_state.detach().to("cpu")
+                torch.set_rng_state(rng_state)
+            except Exception:
+                logger.warning("resume: rng_state invalid; skipping restore")
         if device.type == "cuda":
             cuda_state = ckpt.get("cuda_rng_state")
             if cuda_state is not None:
-                torch.cuda.set_rng_state_all(cuda_state)
+                try:
+                    if isinstance(cuda_state, (list, tuple)):
+                        cuda_state = [
+                            t.detach().to("cpu") if torch.is_tensor(t) else t
+                            for t in cuda_state
+                        ]
+                    torch.cuda.set_rng_state_all(cuda_state)
+                except Exception:
+                    logger.warning("resume: cuda_rng_state invalid; skipping restore")
         logger.info(
             "resume: path=%s epoch=%d step=%d global_step=%d",
             resume_path,
@@ -187,9 +200,14 @@ def main(args):
         )
         start = time.time()
         last_log = start
+        last_time_log = start
         running_loss = 0.0
         running_code = 0.0
         running_nce = 0.0
+        time_loss = 0.0
+        time_code = 0.0
+        time_nce = 0.0
+        time_steps = 0
         for step, (codes, resid, emb, lengths) in enumerate(
             pbar, start=resume_step + 1
         ):
@@ -233,6 +251,10 @@ def main(args):
             running_loss += float(loss)
             running_code += float(code_loss)
             running_nce += float(nce_loss)
+            time_loss += float(loss)
+            time_code += float(code_loss)
+            time_nce += float(nce_loss)
+            time_steps += 1
             if args.log_every > 0 and step % args.log_every == 0:
                 now = time.time()
                 step_time = now - last_log
@@ -251,6 +273,25 @@ def main(args):
                 running_code = 0.0
                 running_nce = 0.0
                 last_log = now
+            if args.log_time_every > 0:
+                now = time.time()
+                if now - last_time_log >= args.log_time_every:
+                    rate = (time_steps / (now - last_time_log)) if time_steps > 0 else 0.0
+                    logger.info(
+                        "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f code=%.4f nce=%.4f",
+                        epoch,
+                        step,
+                        len(train_loader),
+                        rate,
+                        time_loss / max(1, time_steps),
+                        time_code / max(1, time_steps),
+                        time_nce / max(1, time_steps),
+                    )
+                    time_loss = 0.0
+                    time_code = 0.0
+                    time_nce = 0.0
+                    time_steps = 0
+                    last_time_log = now
             if args.save_every > 0 and global_step % args.save_every == 0:
                 ckpt_path = Path(args.out_dir) / "planner_latest.pt"
                 _save_checkpoint(
@@ -331,6 +372,7 @@ if __name__ == "__main__":
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--log_every", type=int, default=200)
+    ap.add_argument("--log_time_every", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--tau", type=float, default=0.07)
     ap.add_argument("--lambda_nce", type=float, default=1.0)
