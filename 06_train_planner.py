@@ -26,6 +26,34 @@ def info_nce(pred, target, tau: float):
     return F.cross_entropy(sim, labels)
 
 
+def _atomic_save(obj, path: Path):
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(obj, str(tmp_path))
+    tmp_path.replace(path)
+
+
+def _move_optimizer_state(opt, device):
+    for state in opt.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def _save_checkpoint(path: Path, model, opt, epoch, step, global_step, config):
+    ckpt = {
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "epoch": epoch,
+        "step": step,
+        "global_step": global_step,
+        "config": config,
+        "rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        ckpt["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+    _atomic_save(ckpt, path)
+
+
 def main(args):
     logger, device = setup_runtime(
         "06_train_planner",
@@ -80,7 +108,57 @@ def main(args):
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    start_step = 0
+    global_step = 0
+    resume_path = None
+    if args.resume and args.resume.lower() != "none":
+        if args.resume == "auto":
+            candidate = Path(args.out_dir) / "planner_latest.pt"
+            if candidate.exists():
+                resume_path = candidate
+        else:
+            resume_path = Path(args.resume)
+    if resume_path and resume_path.exists():
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+            _move_optimizer_state(opt, device)
+        start_epoch = int(ckpt.get("epoch", 0))
+        start_step = int(ckpt.get("step", 0))
+        if "global_step" in ckpt:
+            global_step = int(ckpt["global_step"])
+        else:
+            global_step = start_epoch * len(train_loader) + start_step
+        rng_state = ckpt.get("rng_state")
+        if rng_state is not None:
+            torch.set_rng_state(rng_state)
+        if device.type == "cuda":
+            cuda_state = ckpt.get("cuda_rng_state")
+            if cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
+        logger.info(
+            "resume: path=%s epoch=%d step=%d global_step=%d",
+            resume_path,
+            start_epoch,
+            start_step,
+            global_step,
+        )
+
+    config = {
+        "K": rvq.K,
+        "V_list": rvq.V_list,
+        "d_resid": d_resid,
+        "d_model": args.d_model,
+        "n_layers": args.n_layers,
+        "n_heads": args.n_heads,
+        "max_steps": args.max_steps,
+        "dropout": args.dropout,
+    }
+
+    resume_step = start_step
+    for epoch in range(start_epoch, args.epochs):
         logger.info(
             "epoch=%d train_batches=%d val_batches=%d batch_size=%d",
             epoch,
@@ -89,13 +167,32 @@ def main(args):
             args.batch_size,
         )
         model.train()
-        pbar = tqdm(train_loader, desc=f"epoch {epoch}")
+        train_iter = iter(train_loader)
+        if resume_step > 0:
+            skipped = 0
+            for _ in range(resume_step):
+                try:
+                    next(train_iter)
+                except StopIteration:
+                    break
+                skipped += 1
+            resume_step = skipped
+            if skipped > 0:
+                logger.info("resumed epoch=%d skipped_batches=%d", epoch, skipped)
+        pbar = tqdm(
+            train_iter,
+            total=len(train_loader),
+            initial=resume_step,
+            desc=f"epoch {epoch}",
+        )
         start = time.time()
         last_log = start
         running_loss = 0.0
         running_code = 0.0
         running_nce = 0.0
-        for step, (codes, resid, emb, lengths) in enumerate(pbar, start=1):
+        for step, (codes, resid, emb, lengths) in enumerate(
+            pbar, start=resume_step + 1
+        ):
             codes = codes.to(device, non_blocking=True)
             resid = resid.to(device, non_blocking=True)
             emb = emb.to(device, non_blocking=True)
@@ -131,6 +228,7 @@ def main(args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
+            global_step += 1
             pbar.set_postfix(loss=float(loss), code=float(code_loss), nce=float(nce_loss))
             running_loss += float(loss)
             running_code += float(code_loss)
@@ -153,6 +251,20 @@ def main(args):
                 running_code = 0.0
                 running_nce = 0.0
                 last_log = now
+            if args.save_every > 0 and global_step % args.save_every == 0:
+                ckpt_path = Path(args.out_dir) / "planner_latest.pt"
+                _save_checkpoint(
+                    ckpt_path,
+                    model,
+                    opt,
+                    epoch,
+                    step,
+                    global_step,
+                    config,
+                )
+                logger.info("checkpoint=%s", ckpt_path)
+
+        resume_step = 0
 
         if len(val_ds) > 0:
             model.eval()
@@ -186,21 +298,22 @@ def main(args):
                     losses.append(float(code_loss + args.lambda_nce * nce_loss))
             logger.info("val_loss=%.4f", sum(losses) / max(1, len(losses)))
 
-    ckpt = {
-        "model": model.state_dict(),
-        "config": {
-            "K": rvq.K,
-            "V_list": rvq.V_list,
-            "d_resid": d_resid,
-            "d_model": args.d_model,
-            "n_layers": args.n_layers,
-            "n_heads": args.n_heads,
-            "max_steps": args.max_steps,
-            "dropout": args.dropout,
-        },
-    }
+        if args.save_every > 0:
+            ckpt_path = Path(args.out_dir) / "planner_latest.pt"
+            _save_checkpoint(
+                ckpt_path,
+                model,
+                opt,
+                epoch,
+                len(train_loader),
+                global_step,
+                config,
+            )
+            logger.info("checkpoint=%s", ckpt_path)
+
+    ckpt = {"model": model.state_dict(), "config": config}
     out_path = Path(args.out_dir) / "planner.pt"
-    torch.save(ckpt, str(out_path))
+    _atomic_save(ckpt, out_path)
     logger.info("saved=%s", out_path)
 
 
@@ -226,5 +339,11 @@ if __name__ == "__main__":
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--num_workers", type=int, default=None)
+    ap.add_argument("--save_every", type=int, default=500)
+    ap.add_argument(
+        "--resume",
+        default="auto",
+        help="checkpoint path, 'auto' for out_dir/planner_latest.pt, or 'none'",
+    )
     args = ap.parse_args()
     main(args)
