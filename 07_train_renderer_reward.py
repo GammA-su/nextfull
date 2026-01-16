@@ -1,4 +1,5 @@
 import argparse
+import time
 from pathlib import Path
 
 import torch
@@ -131,9 +132,33 @@ def main(args):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     for epoch in range(args.epochs):
+        logger.info(
+            "epoch=%d train_batches=%d batch_size=%d",
+            epoch,
+            len(loader),
+            args.batch_size,
+        )
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
-        for codes, resid, tgt_emb, _, _ in pbar:
+        start = time.time()
+        last_log = start
+        last_time_log = start
+        running_loss = 0.0
+        running_reward = 0.0
+        running_adv = 0.0
+        running_len = 0.0
+        running_len_pen = 0.0
+        running_rep_pen = 0.0
+        running_inv_pen = 0.0
+        time_loss = 0.0
+        time_reward = 0.0
+        time_adv = 0.0
+        time_len = 0.0
+        time_len_pen = 0.0
+        time_rep_pen = 0.0
+        time_inv_pen = 0.0
+        time_steps = 0
+        for step, (codes, resid, tgt_emb, _, _) in enumerate(pbar, start=1):
             codes = codes.to(device, non_blocking=True)
             resid = resid.to(device, non_blocking=True)
             tgt_emb = tgt_emb.to(device, non_blocking=True)
@@ -195,7 +220,82 @@ def main(args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
-            pbar.set_postfix(loss=float(loss), reward=float(samp_reward.mean()))
+            mean_reward = float(samp_reward.mean())
+            mean_adv = float(adv.mean())
+            mean_len = float(samp_len.float().mean())
+            mean_len_pen = float(samp_len_pen.mean())
+            mean_rep_pen = float(samp_rep_pen.mean())
+            mean_inv_pen = float(samp_inv_pen.mean())
+            pbar.set_postfix(loss=float(loss), reward=mean_reward)
+            running_loss += float(loss)
+            running_reward += mean_reward
+            running_adv += mean_adv
+            running_len += mean_len
+            running_len_pen += mean_len_pen
+            running_rep_pen += mean_rep_pen
+            running_inv_pen += mean_inv_pen
+            time_loss += float(loss)
+            time_reward += mean_reward
+            time_adv += mean_adv
+            time_len += mean_len
+            time_len_pen += mean_len_pen
+            time_rep_pen += mean_rep_pen
+            time_inv_pen += mean_inv_pen
+            time_steps += 1
+            if args.log_every > 0 and step % args.log_every == 0:
+                now = time.time()
+                step_time = now - last_log
+                rate = (args.log_every / step_time) if step_time > 0 else 0.0
+                logger.info(
+                    "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f",
+                    epoch,
+                    step,
+                    len(loader),
+                    rate,
+                    running_loss / args.log_every,
+                    running_reward / args.log_every,
+                    running_adv / args.log_every,
+                    running_len / args.log_every,
+                    running_len_pen / args.log_every,
+                    running_rep_pen / args.log_every,
+                    running_inv_pen / args.log_every,
+                )
+                running_loss = 0.0
+                running_reward = 0.0
+                running_adv = 0.0
+                running_len = 0.0
+                running_len_pen = 0.0
+                running_rep_pen = 0.0
+                running_inv_pen = 0.0
+                last_log = now
+            if args.log_time_every > 0:
+                now = time.time()
+                if now - last_time_log >= args.log_time_every:
+                    rate = (time_steps / (now - last_time_log)) if time_steps > 0 else 0.0
+                    denom = max(1, time_steps)
+                    logger.info(
+                        "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f",
+                        epoch,
+                        step,
+                        len(loader),
+                        rate,
+                        time_loss / denom,
+                        time_reward / denom,
+                        time_adv / denom,
+                        time_len / denom,
+                        time_len_pen / denom,
+                        time_rep_pen / denom,
+                        time_inv_pen / denom,
+                    )
+                    time_loss = 0.0
+                    time_reward = 0.0
+                    time_adv = 0.0
+                    time_len = 0.0
+                    time_len_pen = 0.0
+                    time_rep_pen = 0.0
+                    time_inv_pen = 0.0
+                    time_steps = 0
+                    last_time_log = now
 
     ckpt = {
         "model": model.state_dict(),
@@ -229,6 +329,8 @@ if __name__ == "__main__":
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--log_every", type=int, default=200)
+    ap.add_argument("--log_time_every", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--alpha_len", type=float, default=0.05)
