@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import time
 from pathlib import Path
 
@@ -92,13 +93,30 @@ def main(args):
     )
     ensure_dir(args.out_dir)
 
+    logger.info("load: rvq=%s", args.rvq)
+    t0 = time.time()
     rvq = load_rvq(args.rvq, device=device)
+    logger.info("load: rvq done (%.2fs)", time.time() - t0)
+
+    logger.info("load: train_data=%s", args.train_data)
+    t0 = time.time()
     pack = torch.load(args.train_data, map_location="cpu")
+    logger.info(
+        "load: train_data done (%.2fs) renderer_samples=%d",
+        time.time() - t0,
+        len(pack.get("renderer", [])),
+    )
     train_ds = RendererDataset(pack["renderer"])
     num_workers = args.num_workers
     if num_workers is None:
         num_workers = min(8, max(1, args.threads // 2))
     pin_memory = device.type == "cuda"
+    logger.info(
+        "data: loader batch_size=%d num_workers=%d pin_memory=%s",
+        args.batch_size,
+        num_workers,
+        pin_memory,
+    )
     loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -109,13 +127,17 @@ def main(args):
         persistent_workers=num_workers > 0,
     )
 
+    logger.info("load: encoder=%s", args.encoder)
+    t0 = time.time()
     enc_ckpt = torch.load(args.encoder, map_location=device)
     encoder = ByteEncoder(**enc_ckpt["config"])
     encoder.load_state_dict(enc_ckpt["model"])
     encoder.to(device)
     encoder.eval()
+    logger.info("load: encoder done (%.2fs)", time.time() - t0)
 
     d_resid = pack["renderer"][0]["resid"].shape[0]
+    logger.info("init: renderer d_resid=%d", d_resid)
     model = Renderer(
         K=rvq.K,
         V_list=rvq.V_list,
@@ -130,6 +152,7 @@ def main(args):
     ).to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    logger.info("init: renderer done")
 
     def _atomic_save(obj, path: Path):
         tmp_path = path.with_name(path.name + ".tmp")
@@ -229,14 +252,44 @@ def main(args):
         train_iter = iter(loader)
         skipped = 0
         if skip_steps > 0:
+            t_skip = time.time()
             for _ in range(skip_steps):
                 try:
                     next(train_iter)
                 except StopIteration:
                     break
                 skipped += 1
-            logger.info("resumed epoch=%d skipped_batches=%d", epoch, skipped)
+            logger.info(
+                "resumed epoch=%d skipped_batches=%d (%.2fs)",
+                epoch,
+                skipped,
+                time.time() - t_skip,
+            )
         remaining = max(loader_len - skipped, 0)
+        if remaining > 0:
+            logger.info("data: waiting_for_first_batch epoch=%d", epoch)
+            t_first = time.time()
+            try:
+                first_batch = next(train_iter)
+            except StopIteration:
+                first_batch = None
+                remaining = 0
+            else:
+                dt = time.time() - t_first
+                codes0, resid0, emb0, bytes0, lengths0 = first_batch
+                logger.info(
+                    "data: first_batch_ready epoch=%d time=%.2fs codes=%s resid=%s emb=%s bytes=%s lengths=%s",
+                    epoch,
+                    dt,
+                    tuple(codes0.shape),
+                    tuple(resid0.shape),
+                    tuple(emb0.shape),
+                    tuple(bytes0.shape),
+                    tuple(lengths0.shape),
+                )
+                train_iter = itertools.chain([first_batch], train_iter)
+        else:
+            logger.warning("data: no_batches epoch=%d", epoch)
         pbar = tqdm(train_iter, desc=f"epoch {epoch}", total=remaining)
         start = time.time()
         last_log = start
