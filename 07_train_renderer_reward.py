@@ -131,15 +131,113 @@ def main(args):
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    for epoch in range(args.epochs):
+    def _atomic_save(obj, path: Path):
+        tmp_path = path.with_name(path.name + ".tmp")
+        torch.save(obj, str(tmp_path))
+        tmp_path.replace(path)
+
+    def _move_optimizer_state(opt, device):
+        for state in opt.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device)
+
+    def _save_checkpoint(path: Path, model, opt, epoch, step, global_step, config):
+        ckpt = {
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "epoch": epoch,
+            "step": step,
+            "global_step": global_step,
+            "config": config,
+            "rng_state": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            ckpt["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+        _atomic_save(ckpt, path)
+
+    start_epoch = 0
+    start_step = 0
+    global_step = 0
+    resume_path = None
+    if args.resume and args.resume.lower() != "none":
+        if args.resume == "auto":
+            candidate = Path(args.out_dir) / "renderer_latest.pt"
+            if candidate.exists():
+                resume_path = candidate
+        else:
+            resume_path = Path(args.resume)
+    if resume_path and resume_path.exists():
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt:
+            opt.load_state_dict(ckpt["optimizer"])
+            _move_optimizer_state(opt, device)
+        start_epoch = int(ckpt.get("epoch", 0))
+        start_step = int(ckpt.get("step", 0))
+        global_step = int(ckpt.get("global_step", 0))
+        rng_state = ckpt.get("rng_state")
+        if rng_state is not None:
+            try:
+                if torch.is_tensor(rng_state):
+                    rng_state = rng_state.detach().to("cpu")
+                torch.set_rng_state(rng_state)
+            except Exception:
+                logger.warning("resume: rng_state invalid; skipping restore")
+        if device.type == "cuda":
+            cuda_state = ckpt.get("cuda_rng_state")
+            if cuda_state is not None:
+                try:
+                    if isinstance(cuda_state, (list, tuple)):
+                        cuda_state = [
+                            t.detach().to("cpu") if torch.is_tensor(t) else t
+                            for t in cuda_state
+                        ]
+                    torch.cuda.set_rng_state_all(cuda_state)
+                except Exception:
+                    logger.warning("resume: cuda_rng_state invalid; skipping restore")
+        logger.info(
+            "resume: path=%s epoch=%d step=%d global_step=%d",
+            resume_path,
+            start_epoch,
+            start_step,
+            global_step,
+        )
+
+    config = {
+        "K": rvq.K,
+        "V_list": rvq.V_list,
+        "d_resid": d_resid,
+        "d_model": args.d_model,
+        "n_layers": args.n_layers,
+        "n_heads": args.n_heads,
+        "max_len": args.max_len,
+        "dropout": args.dropout,
+    }
+
+    loader_len = len(loader)
+    resume_step = start_step
+    for epoch in range(start_epoch, args.epochs):
+        skip_steps = resume_step if epoch == start_epoch else 0
         logger.info(
             "epoch=%d train_batches=%d batch_size=%d",
             epoch,
-            len(loader),
+            loader_len,
             args.batch_size,
         )
         model.train()
-        pbar = tqdm(loader, desc=f"epoch {epoch}")
+        train_iter = iter(loader)
+        skipped = 0
+        if skip_steps > 0:
+            for _ in range(skip_steps):
+                try:
+                    next(train_iter)
+                except StopIteration:
+                    break
+                skipped += 1
+            logger.info("resumed epoch=%d skipped_batches=%d", epoch, skipped)
+        remaining = max(loader_len - skipped, 0)
+        pbar = tqdm(train_iter, desc=f"epoch {epoch}", total=remaining)
         start = time.time()
         last_log = start
         last_time_log = start
@@ -158,7 +256,11 @@ def main(args):
         time_rep_pen = 0.0
         time_inv_pen = 0.0
         time_steps = 0
-        for step, (codes, resid, tgt_emb, _, _) in enumerate(pbar, start=1):
+        step_in_epoch = 0
+        last_step = skip_steps
+        for step_in_epoch, (codes, resid, tgt_emb, _, _) in enumerate(pbar, start=1):
+            step = skip_steps + step_in_epoch
+            last_step = step
             codes = codes.to(device, non_blocking=True)
             resid = resid.to(device, non_blocking=True)
             tgt_emb = tgt_emb.to(device, non_blocking=True)
@@ -242,6 +344,19 @@ def main(args):
             time_rep_pen += mean_rep_pen
             time_inv_pen += mean_inv_pen
             time_steps += 1
+            global_step += 1
+            if args.save_every > 0 and global_step % args.save_every == 0:
+                ckpt_path = Path(args.out_dir) / "renderer_latest.pt"
+                _save_checkpoint(
+                    ckpt_path,
+                    model,
+                    opt,
+                    epoch,
+                    step,
+                    global_step,
+                    config,
+                )
+                logger.info("checkpoint=%s", ckpt_path)
             if args.log_every > 0 and step % args.log_every == 0:
                 now = time.time()
                 step_time = now - last_log
@@ -296,22 +411,25 @@ def main(args):
                     time_inv_pen = 0.0
                     time_steps = 0
                     last_time_log = now
-
-    ckpt = {
+        if last_step > skip_steps:
+            ckpt_path = Path(args.out_dir) / "renderer_latest.pt"
+            _save_checkpoint(
+                ckpt_path,
+                model,
+                opt,
+                epoch,
+                last_step,
+                global_step,
+                config,
+            )
+            logger.info("checkpoint=%s", ckpt_path)
+        resume_step = 0
+    final_ckpt = {
         "model": model.state_dict(),
-        "config": {
-            "K": rvq.K,
-            "V_list": rvq.V_list,
-            "d_resid": d_resid,
-            "d_model": args.d_model,
-            "n_layers": args.n_layers,
-            "n_heads": args.n_heads,
-            "max_len": args.max_len,
-            "dropout": args.dropout,
-        },
+        "config": config,
     }
     out_path = Path(args.out_dir) / "renderer.pt"
-    torch.save(ckpt, str(out_path))
+    _atomic_save(final_ckpt, out_path)
     logger.info("saved=%s", out_path)
 
 
@@ -331,6 +449,12 @@ if __name__ == "__main__":
     ap.add_argument("--epochs", type=int, default=5)
     ap.add_argument("--log_every", type=int, default=200)
     ap.add_argument("--log_time_every", type=int, default=30)
+    ap.add_argument("--save_every", type=int, default=200)
+    ap.add_argument(
+        "--resume",
+        default="auto",
+        help="checkpoint path, 'auto' for renderer_latest.pt in out_dir, or 'none'",
+    )
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--alpha_len", type=float, default=0.05)
