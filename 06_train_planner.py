@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import time
 from pathlib import Path
 
@@ -63,13 +64,35 @@ def main(args):
     )
     ensure_dir(args.out_dir)
 
+    logger.info("load: rvq=%s", args.rvq)
+    t0 = time.time()
     rvq = load_rvq(args.rvq, device=device)
+    logger.info("load: rvq done (%.2fs) K=%d", time.time() - t0, rvq.K)
 
+    logger.info("load: train_data=%s", args.train_data)
+    t0 = time.time()
     train_pack = torch.load(args.train_data, map_location="cpu")
+    logger.info(
+        "load: train_data done (%.2fs) planner_samples=%d",
+        time.time() - t0,
+        len(train_pack.get("planner", [])),
+    )
+    logger.info("load: val_data=%s", args.val_data)
+    t0 = time.time()
     val_pack = torch.load(args.val_data, map_location="cpu")
+    logger.info(
+        "load: val_data done (%.2fs) planner_samples=%d",
+        time.time() - t0,
+        len(val_pack.get("planner", [])),
+    )
 
     train_ds = PlannerSequenceDataset(train_pack["planner"])
     val_ds = PlannerSequenceDataset(val_pack["planner"])
+    logger.info(
+        "data: train_sequences=%d val_sequences=%d",
+        len(train_ds),
+        len(val_ds),
+    )
 
     num_workers = args.num_workers
     if num_workers is None:
@@ -92,6 +115,14 @@ def main(args):
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
+    )
+    logger.info(
+        "data: loaders train_batches=%d val_batches=%d batch_size=%d num_workers=%d pin_memory=%s",
+        len(train_loader),
+        len(val_loader),
+        args.batch_size,
+        num_workers,
+        pin_memory,
     )
 
     d_resid = train_pack["planner"][0]["resid"].shape[1]
@@ -181,8 +212,8 @@ def main(args):
         )
         model.train()
         train_iter = iter(train_loader)
+        skipped = 0
         if resume_step > 0:
-            skipped = 0
             for _ in range(resume_step):
                 try:
                     next(train_iter)
@@ -192,6 +223,30 @@ def main(args):
             resume_step = skipped
             if skipped > 0:
                 logger.info("resumed epoch=%d skipped_batches=%d", epoch, skipped)
+        remaining = max(len(train_loader) - skipped, 0)
+        if remaining > 0:
+            logger.info("data: waiting_for_first_batch epoch=%d", epoch)
+            t_first = time.time()
+            try:
+                first_batch = next(train_iter)
+            except StopIteration:
+                first_batch = None
+                remaining = 0
+            else:
+                dt = time.time() - t_first
+                codes0, resid0, emb0, lengths0 = first_batch
+                logger.info(
+                    "data: first_batch_ready epoch=%d time=%.2fs codes=%s resid=%s emb=%s lengths=%s",
+                    epoch,
+                    dt,
+                    tuple(codes0.shape),
+                    tuple(resid0.shape),
+                    tuple(emb0.shape),
+                    tuple(lengths0.shape),
+                )
+                train_iter = itertools.chain([first_batch], train_iter)
+        else:
+            logger.warning("data: no_batches epoch=%d", epoch)
         pbar = tqdm(
             train_iter,
             total=len(train_loader),

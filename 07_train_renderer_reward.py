@@ -1,5 +1,6 @@
 import argparse
 import itertools
+import re
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from tools.data import (
     BYTE_PAD,
     BYTE_VOCAB_SIZE,
     RendererDataset,
+    bytes_to_text,
     collate_renderer,
     tokens_to_bytes,
 )
@@ -22,6 +24,7 @@ from tools.reward import (
     batch_repetition_penalty,
     cosine_reward,
     length_penalty,
+    quality_override,
     utf8_invalid_penalty,
 )
 from tools.rvq import load_rvq
@@ -159,6 +162,31 @@ def main(args):
         torch.save(obj, str(tmp_path))
         tmp_path.replace(path)
 
+    def _find_latest_checkpoint(out_dir: Path):
+        latest_path = out_dir / "renderer_latest.pt"
+        step_re = re.compile(r"renderer_step_(\d+)$")
+        best_path = None
+        best_step = -1
+        for path in out_dir.glob("renderer_step_*.pt"):
+            match = step_re.match(path.stem)
+            if not match:
+                continue
+            step = int(match.group(1))
+            if step > best_step:
+                best_step = step
+                best_path = path
+        if latest_path.exists():
+            if best_path is None:
+                return latest_path
+            try:
+                latest_ckpt = torch.load(latest_path, map_location="cpu")
+                latest_step = int(latest_ckpt.get("global_step", -1))
+            except Exception:
+                latest_step = -1
+            if latest_step >= best_step:
+                return latest_path
+        return best_path
+
     def _move_optimizer_state(opt, device):
         for state in opt.state.values():
             for key, value in state.items():
@@ -185,9 +213,7 @@ def main(args):
     resume_path = None
     if args.resume and args.resume.lower() != "none":
         if args.resume == "auto":
-            candidate = Path(args.out_dir) / "renderer_latest.pt"
-            if candidate.exists():
-                resume_path = candidate
+            resume_path = _find_latest_checkpoint(Path(args.out_dir))
         else:
             resume_path = Path(args.resume)
     if resume_path and resume_path.exists():
@@ -239,6 +265,9 @@ def main(args):
     }
 
     loader_len = len(loader)
+    numbered_every = args.save_numbered_every
+    if numbered_every is None:
+        numbered_every = args.save_every
     resume_step = start_step
     for epoch in range(start_epoch, args.epochs):
         skip_steps = resume_step if epoch == start_epoch else 0
@@ -342,6 +371,19 @@ def main(args):
             samp_reward = cosine_reward(samp_emb, tgt_emb)
             greedy_reward = cosine_reward(greedy_emb, tgt_emb)
 
+            samp_qmask, samp_qvals = quality_override(
+                samp_tokens_list, args.min_len_bytes
+            )
+            greedy_qmask, greedy_qvals = quality_override(
+                greedy_tokens_list, args.min_len_bytes
+            )
+            samp_reward = torch.where(
+                samp_qmask.to(device), samp_qvals.to(device), samp_reward
+            )
+            greedy_reward = torch.where(
+                greedy_qmask.to(device), greedy_qvals.to(device), greedy_reward
+            )
+
             samp_len_pen = length_penalty(samp_len, args.alpha_len, args.max_len)
             samp_rep_pen = batch_repetition_penalty(samp_tokens_list).to(device) * args.beta_rep
             samp_inv_pen = utf8_invalid_penalty(samp_tokens_list, args.invalid_penalty).to(device)
@@ -354,7 +396,8 @@ def main(args):
             greedy_reward = greedy_reward - greedy_len_pen - greedy_rep_pen - greedy_inv_pen
 
             adv = samp_reward - greedy_reward
-            adv = adv.clamp(min=-args.adv_clip, max=args.adv_clip)
+            adv_clip = min(1.0, args.adv_clip)
+            adv = adv.clamp(min=-adv_clip, max=adv_clip)
 
             token_logp = samp_token_logp
             mask = (
@@ -410,6 +453,18 @@ def main(args):
                     config,
                 )
                 logger.info("checkpoint=%s", ckpt_path)
+            if numbered_every and numbered_every > 0 and global_step % numbered_every == 0:
+                ckpt_path = Path(args.out_dir) / f"renderer_step_{global_step}.pt"
+                _save_checkpoint(
+                    ckpt_path,
+                    model,
+                    opt,
+                    epoch,
+                    step,
+                    global_step,
+                    config,
+                )
+                logger.info("checkpoint=%s", ckpt_path)
             if args.log_every > 0 and step % args.log_every == 0:
                 now = time.time()
                 step_time = now - last_log
@@ -428,6 +483,14 @@ def main(args):
                     running_rep_pen / args.log_every,
                     running_inv_pen / args.log_every,
                 )
+                if samp_tokens_list and greedy_tokens_list:
+                    sample_text = bytes_to_text(samp_tokens_list[0])
+                    greedy_text = bytes_to_text(greedy_tokens_list[0])
+                    logger.info(
+                        "sample_text=%r greedy_text=%r",
+                        sample_text[:80],
+                        greedy_text[:80],
+                    )
                 running_loss = 0.0
                 running_reward = 0.0
                 running_adv = 0.0
@@ -504,16 +567,23 @@ if __name__ == "__main__":
     ap.add_argument("--log_time_every", type=int, default=30)
     ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument(
+        "--save_numbered_every",
+        type=int,
+        default=None,
+        help="save renderer_step_{global_step}.pt every N steps (defaults to save_every)",
+    )
+    ap.add_argument(
         "--resume",
         default="auto",
-        help="checkpoint path, 'auto' for renderer_latest.pt in out_dir, or 'none'",
+        help="checkpoint path, 'auto' for latest renderer_step_*.pt or renderer_latest.pt, or 'none'",
     )
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--alpha_len", type=float, default=0.05)
     ap.add_argument("--beta_rep", type=float, default=0.1)
     ap.add_argument("--invalid_penalty", type=float, default=0.5)
-    ap.add_argument("--adv_clip", type=float, default=2.0)
+    ap.add_argument("--min_len_bytes", type=int, default=32)
+    ap.add_argument("--adv_clip", type=float, default=1.0)
     ap.add_argument("--entropy_bonus", type=float, default=0.0)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)

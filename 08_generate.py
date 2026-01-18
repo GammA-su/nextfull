@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 import torch
@@ -58,7 +59,14 @@ def main(args):
     planner.to(device)
     planner.eval()
 
-    rend_ckpt = torch.load(args.renderer, map_location=device)
+    rend_path = args.renderer
+    if not os.path.exists(rend_path):
+        fallback = "out/renderer_latest.pt"
+        if rend_path == "out/renderer.pt" and os.path.exists(fallback):
+            rend_path = fallback
+        else:
+            raise FileNotFoundError(rend_path)
+    rend_ckpt = torch.load(rend_path, map_location=device)
     renderer = Renderer(**rend_ckpt["config"], vocab_size=BYTE_VOCAB_SIZE)
     renderer.load_state_dict(rend_ckpt["model"])
     renderer.to(device)

@@ -1,5 +1,5 @@
 import math
-from typing import List
+from typing import List, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -38,3 +38,43 @@ def utf8_invalid_penalty(batch_tokens: List[List[int]], penalty: float):
         except UnicodeDecodeError:
             out.append(penalty)
     return torch.tensor(out, dtype=torch.float32)
+
+
+def only_whitespace_or_punct(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return not any(ch.isalnum() for ch in stripped)
+
+
+def quality_override(
+    batch_tokens: List[List[int]],
+    min_len_bytes: int,
+    short_reward: float = -1.0,
+    invalid_reward: float = -2.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    mask = []
+    values = []
+    for tokens in batch_tokens:
+        data = bytes([t for t in tokens if 0 <= t < 256])
+        if not data:
+            mask.append(True)
+            values.append(invalid_reward)
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            mask.append(True)
+            values.append(invalid_reward)
+            continue
+        if text == "":
+            mask.append(True)
+            values.append(invalid_reward)
+            continue
+        if len(data) < min_len_bytes or only_whitespace_or_punct(text):
+            mask.append(True)
+            values.append(short_reward)
+            continue
+        mask.append(False)
+        values.append(0.0)
+    return torch.tensor(mask, dtype=torch.bool), torch.tensor(values, dtype=torch.float32)

@@ -52,14 +52,21 @@ def main(args):
     rvq = load_rvq(args.rvq, device=device)
 
     faiss_available, faiss_gpu_count = detect_faiss()
-    use_faiss = (not args.no_faiss) and faiss_available and faiss_gpu_count > 0
+    use_faiss = (not args.no_faiss) and faiss_available
+    use_faiss_gpu = use_faiss and args.faiss_gpu and faiss_gpu_count > 0
+    if use_faiss and args.faiss_gpu and faiss_gpu_count == 0:
+        logger.warning("faiss_gpu requested but no faiss GPU available; using CPU")
     if use_faiss and rvq.usage_balance_w > 0:
         logger.warning(
             "faiss encode ignores usage_balance_w=%.3f", rvq.usage_balance_w
         )
     if use_faiss:
-        logger.info("faiss_encode=true faiss_gpu=true gpus=%d", faiss_gpu_count)
-        indexes, cb_np_list = build_faiss_indexes(rvq.codebooks, use_gpu=True)
+        logger.info(
+            "faiss_encode=true faiss_gpu=%s gpus=%d",
+            use_faiss_gpu,
+            faiss_gpu_count,
+        )
+        indexes, cb_np_list = build_faiss_indexes(rvq.codebooks, use_gpu=use_faiss_gpu)
     else:
         logger.info("faiss_encode=false (fallback to torch)")
 
@@ -122,6 +129,11 @@ if __name__ == "__main__":
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--no_faiss", action="store_true")
+    ap.add_argument(
+        "--faiss_gpu",
+        action="store_true",
+        help="enable faiss GPU index (default uses CPU faiss if available)",
+    )
     ap.add_argument("--log_every", type=int, default=100000)
     args = ap.parse_args()
     main(args)
