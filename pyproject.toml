@@ -7,6 +7,9 @@ dependencies = [
   "numpy<2",
   "tqdm",
   "regex",
+  "xxhash",
+  "datasets",
+  "faiss-gpu",
 ]
 
 [build-system]
