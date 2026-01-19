@@ -23,6 +23,14 @@ class ByteEncoder(nn.Module):
         self.d_emb = d_emb
         self.max_len = max_len
         self.pad_id = pad_id
+        self.config = {
+            "d_model": d_model,
+            "n_layers": n_layers,
+            "n_heads": n_heads,
+            "max_len": max_len,
+            "d_emb": d_emb,
+            "dropout": dropout,
+        }
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Parameter(torch.randn(max_len, d_model) / math.sqrt(d_model))
         enc_layer = nn.TransformerEncoderLayer(
@@ -52,6 +60,10 @@ class ByteEncoder(nn.Module):
         emb = F.normalize(emb, dim=-1)
         return emb
 
+    def save(self, path: str) -> None:
+        ckpt = {"model": self.state_dict(), "config": self.config}
+        torch.save(ckpt, path)
+
 
 def load_encoder(path: str, device: str):
     ckpt = torch.load(path, map_location=device)
@@ -60,3 +72,17 @@ def load_encoder(path: str, device: str):
     model.to(device)
     model.eval()
     return model
+
+
+def encode_texts(model: ByteEncoder, texts, max_len: int, device: str):
+    from tools.data import text_to_bytes
+
+    batch = []
+    for text in texts:
+        ids = text_to_bytes(text, max_len=max_len, add_eos=True)
+        if len(ids) < max_len:
+            ids = ids + [BYTE_PAD] * (max_len - len(ids))
+        batch.append(ids)
+    ids = torch.tensor(batch, dtype=torch.long, device=device)
+    with torch.inference_mode():
+        return model(ids)

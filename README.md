@@ -18,6 +18,12 @@ Create `data/raw.txt` with one document per line.
 
 ## Path B: Build raw.txt from Hugging Face
 
+These scripts require extra packages (not in the minimal install):
+
+```
+uv pip install datasets pyarrow zstandard xxhash
+```
+
 ```
 python bin/00_list_hf_configs.py --dataset epfml/FineWeb2-HQ
 python bin/00_build_raw_from_hf.py \

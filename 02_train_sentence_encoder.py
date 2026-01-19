@@ -122,6 +122,7 @@ def main(args):
 
     step = 0
     model.train()
+    stop_training = False
     for epoch in range(args.epochs):
         pbar = tqdm(train_loader, desc=f"epoch {epoch}")
         for ctx_ids, nxt_ids in pbar:
@@ -136,6 +137,9 @@ def main(args):
             opt.step()
             step += 1
             pbar.set_postfix(loss=float(loss.detach()))
+            if args.steps and step >= args.steps:
+                stop_training = True
+                break
 
         if val_pairs:
             model.eval()
@@ -150,6 +154,8 @@ def main(args):
                     losses.append(float(vloss.detach()))
             logger.info("val_loss=%.4f", sum(losses) / max(1, len(losses)))
             model.train()
+        if stop_training:
+            break
 
     ckpt = {
         "model": model.state_dict(),
@@ -179,6 +185,7 @@ if __name__ == "__main__":
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--steps", type=int, default=0)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--tau", type=float, default=0.07)
     ap.add_argument("--grad_clip", type=float, default=1.0)

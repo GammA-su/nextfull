@@ -34,8 +34,7 @@ def main(args):
 
     sent_text = [s["text"] for s in sentences]
 
-    doc_ids = [seq["doc_id"] for seq in sequences]
-    doc_ids = list(set(doc_ids))
+    doc_ids = sorted({seq["doc_id"] for seq in sequences})
     random.shuffle(doc_ids)
     n_val = max(1, int(len(doc_ids) * args.val_frac))
     val_docs = set(doc_ids[:n_val])

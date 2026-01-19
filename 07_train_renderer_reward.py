@@ -269,6 +269,7 @@ def main(args):
     if numbered_every is None:
         numbered_every = args.save_every
     resume_step = start_step
+    stop_training = False
     for epoch in range(start_epoch, args.epochs):
         skip_steps = resume_step if epoch == start_epoch else 0
         logger.info(
@@ -395,7 +396,9 @@ def main(args):
             samp_reward = samp_reward - samp_len_pen - samp_rep_pen - samp_inv_pen
             greedy_reward = greedy_reward - greedy_len_pen - greedy_rep_pen - greedy_inv_pen
 
-            adv = (samp_reward - greedy_reward).clamp(min=-1.0, max=1.0)
+            adv = (samp_reward - greedy_reward).clamp(
+                min=-args.adv_clip, max=args.adv_clip
+            )
 
             token_logp = samp_token_logp
             mask = (
@@ -422,15 +425,15 @@ def main(args):
             mean_len_pen = float(samp_len_pen.mean())
             mean_rep_pen = float(samp_rep_pen.mean())
             mean_inv_pen = float(samp_inv_pen.mean())
-            pbar.set_postfix(loss=float(loss), reward=mean_reward)
-            running_loss += float(loss)
+            pbar.set_postfix(loss=float(loss.detach()), reward=mean_reward)
+            running_loss += float(loss.detach())
             running_reward += mean_reward
             running_adv += mean_adv
             running_len += mean_len
             running_len_pen += mean_len_pen
             running_rep_pen += mean_rep_pen
             running_inv_pen += mean_inv_pen
-            time_loss += float(loss)
+            time_loss += float(loss.detach())
             time_reward += mean_reward
             time_adv += mean_adv
             time_len += mean_len
@@ -463,6 +466,9 @@ def main(args):
                     config,
                 )
                 logger.info("checkpoint=%s", ckpt_path)
+            if args.steps and global_step >= args.steps:
+                stop_training = True
+                break
             if args.log_every > 0 and step % args.log_every == 0:
                 now = time.time()
                 step_time = now - last_log
@@ -543,6 +549,8 @@ def main(args):
             )
             logger.info("checkpoint=%s", ckpt_path)
         resume_step = 0
+        if stop_training:
+            break
     final_ckpt = {
         "model": model.state_dict(),
         "config": config,
@@ -566,6 +574,7 @@ if __name__ == "__main__":
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--steps", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=200)
     ap.add_argument("--log_time_every", type=int, default=30)
     ap.add_argument("--save_every", type=int, default=200)

@@ -60,3 +60,27 @@ class Renderer(nn.Module):
         pooled = h.mean(dim=1)
         len_logits = self.len_head(pooled)
         return logits, len_logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        codes: torch.Tensor,
+        resid: torch.Tensor,
+        ctx: torch.Tensor = None,
+        sample: bool = False,
+        temperature: float = 1.0,
+    ):
+        logits, len_logits = self.forward(codes, resid, ctx=ctx)
+        length_logits = len_logits[:, 1:]
+        if sample:
+            length_probs = torch.softmax(length_logits, dim=-1)
+            lengths = torch.multinomial(length_probs, num_samples=1).squeeze(1) + 1
+            token_logits = logits if temperature == 1.0 else logits / temperature
+            token_probs = torch.softmax(token_logits, dim=-1)
+            tokens = torch.multinomial(
+                token_probs.view(-1, token_probs.size(-1)), 1
+            ).view(token_probs.size(0), token_probs.size(1))
+        else:
+            lengths = length_logits.argmax(dim=-1) + 1
+            tokens = logits.argmax(dim=-1)
+        return tokens, lengths, logits, len_logits

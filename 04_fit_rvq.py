@@ -58,6 +58,8 @@ def main(args):
         device=device,
     ).to(device)
 
+    global_step = 0
+    stop_training = False
     for epoch in range(args.epochs):
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         start = time.time()
@@ -65,6 +67,10 @@ def main(args):
         for step, batch in enumerate(pbar, start=1):
             x = batch.to(device, non_blocking=True)
             rvq.update(x)
+            global_step += 1
+            if args.steps and global_step >= args.steps:
+                stop_training = True
+                break
             if args.log_every > 0 and step % args.log_every == 0:
                 now = time.time()
                 step_time = now - last_log
@@ -86,6 +92,8 @@ def main(args):
             entropy = -(probs * np.log(probs + 1e-8)).sum()
             usage.append(entropy)
         logger.info("usage_entropy=%s", [f"{u:.2f}" for u in usage])
+        if stop_training:
+            break
 
     ckpt = {
         "model": rvq.state_dict(),
@@ -113,6 +121,7 @@ if __name__ == "__main__":
     ap.add_argument("--usage_balance_w", type=float, default=1.0)
     ap.add_argument("--batch_size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--steps", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=100)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

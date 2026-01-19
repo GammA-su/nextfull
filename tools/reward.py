@@ -78,3 +78,31 @@ def quality_override(
         mask.append(False)
         values.append(0.0)
     return torch.tensor(mask, dtype=torch.bool), torch.tensor(values, dtype=torch.float32)
+
+
+def compute_reward(
+    gen_emb: torch.Tensor,
+    tgt_emb: torch.Tensor,
+    batch_tokens: List[List[int]],
+    lengths: torch.Tensor,
+    max_len: int,
+    alpha_len: float,
+    beta_rep: float,
+    invalid_penalty: float,
+    min_len_bytes: int = 32,
+):
+    cos = cosine_reward(gen_emb, tgt_emb)
+    len_pen = length_penalty(lengths, alpha_len, max_len).to(cos.device)
+    rep_pen = batch_repetition_penalty(batch_tokens).to(cos.device) * beta_rep
+    inv_pen = utf8_invalid_penalty(batch_tokens, invalid_penalty).to(cos.device)
+    reward = cos - len_pen - rep_pen - inv_pen
+    qmask, qvals = quality_override(batch_tokens, min_len_bytes=min_len_bytes)
+    reward = torch.where(qmask.to(cos.device), qvals.to(cos.device), reward)
+    return reward, {
+        "cosine": cos,
+        "len_pen": len_pen,
+        "rep_pen": rep_pen,
+        "inv_pen": inv_pen,
+        "qmask": qmask,
+        "qvals": qvals,
+    }

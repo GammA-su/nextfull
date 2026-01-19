@@ -202,6 +202,7 @@ def main(args):
     }
 
     resume_step = start_step
+    stop_training = False
     for epoch in range(start_epoch, args.epochs):
         logger.info(
             "epoch=%d train_batches=%d val_batches=%d batch_size=%d",
@@ -259,9 +260,13 @@ def main(args):
         running_loss = 0.0
         running_code = 0.0
         running_nce = 0.0
+        running_correct = [0.0 for _ in range(rvq.K)]
+        running_total = [0.0 for _ in range(rvq.K)]
         time_loss = 0.0
         time_code = 0.0
         time_nce = 0.0
+        time_correct = [0.0 for _ in range(rvq.K)]
+        time_total = [0.0 for _ in range(rvq.K)]
         time_steps = 0
         for step, (codes, resid, emb, lengths) in enumerate(
             pbar, start=resume_step + 1
@@ -283,6 +288,15 @@ def main(args):
                 targets_k = codes[:, 1:, k].reshape(-1)
                 mask_k = mask.reshape(-1)
                 code_loss = code_loss + masked_ce(logits_k, targets_k, mask_k)
+                with torch.no_grad():
+                    pred_k = logits_k.argmax(dim=-1)
+                    correct_k = (pred_k == targets_k) & mask_k
+                    correct_sum = float(correct_k.sum())
+                    total_sum = float(mask_k.sum())
+                    running_correct[k] += correct_sum
+                    running_total[k] += total_sum
+                    time_correct[k] += correct_sum
+                    time_total[k] += total_sum
 
             pred = pred_resid[:, :-1, :].reshape(-1, pred_resid.size(-1))
             tgt = emb[:, 1:, :].reshape(-1, emb.size(-1))
@@ -302,20 +316,28 @@ def main(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
             global_step += 1
-            pbar.set_postfix(loss=float(loss), code=float(code_loss), nce=float(nce_loss))
-            running_loss += float(loss)
-            running_code += float(code_loss)
-            running_nce += float(nce_loss)
-            time_loss += float(loss)
-            time_code += float(code_loss)
-            time_nce += float(nce_loss)
+            pbar.set_postfix(
+                loss=float(loss.detach()),
+                code=float(code_loss.detach()),
+                nce=float(nce_loss.detach()),
+            )
+            running_loss += float(loss.detach())
+            running_code += float(code_loss.detach())
+            running_nce += float(nce_loss.detach())
+            time_loss += float(loss.detach())
+            time_code += float(code_loss.detach())
+            time_nce += float(nce_loss.detach())
             time_steps += 1
             if args.log_every > 0 and step % args.log_every == 0:
                 now = time.time()
                 step_time = now - last_log
                 rate = (args.log_every / step_time) if step_time > 0 else 0.0
+                acc = [
+                    (running_correct[k] / max(1.0, running_total[k]))
+                    for k in range(rvq.K)
+                ]
                 logger.info(
-                    "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f code=%.4f nce=%.4f",
+                    "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f code=%.4f nce=%.4f acc=%s",
                     epoch,
                     step,
                     len(train_loader),
@@ -323,17 +345,24 @@ def main(args):
                     running_loss / args.log_every,
                     running_code / args.log_every,
                     running_nce / args.log_every,
+                    [f"{a:.3f}" for a in acc],
                 )
                 running_loss = 0.0
                 running_code = 0.0
                 running_nce = 0.0
+                running_correct = [0.0 for _ in range(rvq.K)]
+                running_total = [0.0 for _ in range(rvq.K)]
                 last_log = now
             if args.log_time_every > 0:
                 now = time.time()
                 if now - last_time_log >= args.log_time_every:
                     rate = (time_steps / (now - last_time_log)) if time_steps > 0 else 0.0
+                    acc = [
+                        (time_correct[k] / max(1.0, time_total[k]))
+                        for k in range(rvq.K)
+                    ]
                     logger.info(
-                        "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f code=%.4f nce=%.4f",
+                        "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f code=%.4f nce=%.4f acc=%s",
                         epoch,
                         step,
                         len(train_loader),
@@ -341,10 +370,13 @@ def main(args):
                         time_loss / max(1, time_steps),
                         time_code / max(1, time_steps),
                         time_nce / max(1, time_steps),
+                        [f"{a:.3f}" for a in acc],
                     )
                     time_loss = 0.0
                     time_code = 0.0
                     time_nce = 0.0
+                    time_correct = [0.0 for _ in range(rvq.K)]
+                    time_total = [0.0 for _ in range(rvq.K)]
                     time_steps = 0
                     last_time_log = now
             if args.save_every > 0 and global_step % args.save_every == 0:
@@ -359,12 +391,19 @@ def main(args):
                     config,
                 )
                 logger.info("checkpoint=%s", ckpt_path)
+            if args.steps and global_step >= args.steps:
+                stop_training = True
+                break
 
         resume_step = 0
+        if stop_training:
+            break
 
         if len(val_ds) > 0:
             model.eval()
             losses = []
+            val_correct = [0.0 for _ in range(rvq.K)]
+            val_total = [0.0 for _ in range(rvq.K)]
             with torch.no_grad():
                 for codes, resid, emb, lengths in val_loader:
                     codes = codes.to(device, non_blocking=True)
@@ -382,6 +421,10 @@ def main(args):
                         targets_k = codes[:, 1:, k].reshape(-1)
                         mask_k = mask.reshape(-1)
                         code_loss = code_loss + masked_ce(logits_k, targets_k, mask_k)
+                        pred_k = logits_k.argmax(dim=-1)
+                        correct_k = (pred_k == targets_k) & mask_k
+                        val_correct[k] += float(correct_k.sum())
+                        val_total[k] += float(mask_k.sum())
                     pred = pred_resid[:, :-1, :].reshape(-1, pred_resid.size(-1))
                     tgt = emb[:, 1:, :].reshape(-1, emb.size(-1))
                     mask_flat = mask.reshape(-1)
@@ -392,7 +435,14 @@ def main(args):
                     else:
                         nce_loss = torch.tensor(0.0, device=device)
                     losses.append(float(code_loss + args.lambda_nce * nce_loss))
-            logger.info("val_loss=%.4f", sum(losses) / max(1, len(losses)))
+            val_acc = [
+                (val_correct[k] / max(1.0, val_total[k])) for k in range(rvq.K)
+            ]
+            logger.info(
+                "val_loss=%.4f val_acc=%s",
+                sum(losses) / max(1, len(losses)),
+                [f"{a:.3f}" for a in val_acc],
+            )
 
         if args.save_every > 0:
             ckpt_path = Path(args.out_dir) / "planner_latest.pt"
@@ -426,6 +476,7 @@ if __name__ == "__main__":
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--steps", type=int, default=0)
     ap.add_argument("--log_every", type=int, default=200)
     ap.add_argument("--log_time_every", type=int, default=30)
     ap.add_argument("--lr", type=float, default=3e-4)
