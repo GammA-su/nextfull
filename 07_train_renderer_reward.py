@@ -395,9 +395,7 @@ def main(args):
             samp_reward = samp_reward - samp_len_pen - samp_rep_pen - samp_inv_pen
             greedy_reward = greedy_reward - greedy_len_pen - greedy_rep_pen - greedy_inv_pen
 
-            adv = samp_reward - greedy_reward
-            adv_clip = min(1.0, args.adv_clip)
-            adv = adv.clamp(min=-adv_clip, max=adv_clip)
+            adv = (samp_reward - greedy_reward).clamp(min=-1.0, max=1.0)
 
             token_logp = samp_token_logp
             mask = (
@@ -483,14 +481,19 @@ def main(args):
                     running_rep_pen / args.log_every,
                     running_inv_pen / args.log_every,
                 )
-                if samp_tokens_list and greedy_tokens_list:
+                if samp_tokens_list:
                     sample_text = bytes_to_text(samp_tokens_list[0])
+                else:
+                    sample_text = ""
+                if greedy_tokens_list:
                     greedy_text = bytes_to_text(greedy_tokens_list[0])
-                    logger.info(
-                        "sample_text=%r greedy_text=%r",
-                        sample_text[:80],
-                        greedy_text[:80],
-                    )
+                else:
+                    greedy_text = ""
+                logger.info(
+                    "sample_text=%r greedy_text=%r",
+                    sample_text[:80],
+                    greedy_text[:80],
+                )
                 running_loss = 0.0
                 running_reward = 0.0
                 running_adv = 0.0

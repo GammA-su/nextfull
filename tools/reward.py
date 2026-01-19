@@ -49,7 +49,7 @@ def only_whitespace_or_punct(text: str) -> bool:
 
 def quality_override(
     batch_tokens: List[List[int]],
-    min_len_bytes: int,
+    min_len_bytes: int = 32,
     short_reward: float = -1.0,
     invalid_reward: float = -2.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
