@@ -12,3 +12,4 @@ out/
 *.npy
 *.npz
 *.jsonl
+data_sub/

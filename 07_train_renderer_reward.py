@@ -20,51 +20,9 @@ from tools.data import (
 )
 from tools.encoder import ByteEncoder
 from tools.renderer import Renderer
-from tools.reward import (
-    batch_repetition_penalty,
-    cosine_reward,
-    length_penalty,
-    quality_override,
-    utf8_invalid_penalty,
-)
+from tools.reward import reward
 from tools.rvq import load_rvq
 from utils import ensure_dir, setup_runtime
-
-
-def sample_lengths(len_logits):
-    logits = len_logits[:, 1:]
-    probs = F.softmax(logits, dim=-1)
-    lengths = torch.multinomial(probs, num_samples=1).squeeze(1) + 1
-    logp = torch.log(torch.gather(probs, 1, (lengths - 1).unsqueeze(1)).squeeze(1) + 1e-8)
-    return lengths, logp
-
-
-def greedy_lengths(len_logits):
-    logits = len_logits[:, 1:]
-    lengths = logits.argmax(dim=-1) + 1
-    probs = F.softmax(logits, dim=-1)
-    logp = torch.log(torch.gather(probs, 1, (lengths - 1).unsqueeze(1)).squeeze(1) + 1e-8)
-    return lengths, logp
-
-
-def sample_tokens(logits, temperature: float):
-    if temperature != 1.0:
-        logits = logits / temperature
-    probs = F.softmax(logits, dim=-1)
-    tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(probs.size(0), probs.size(1))
-    logp = torch.log(
-        torch.gather(probs, -1, tokens.unsqueeze(-1)).squeeze(-1) + 1e-8
-    )
-    return tokens, logp
-
-
-def greedy_tokens(logits):
-    tokens = logits.argmax(dim=-1)
-    probs = F.softmax(logits, dim=-1)
-    logp = torch.log(
-        torch.gather(probs, -1, tokens.unsqueeze(-1)).squeeze(-1) + 1e-8
-    )
-    return tokens, logp
 
 
 def build_encoder_inputs(batch_tokens, max_len):
@@ -331,6 +289,8 @@ def main(args):
         running_len_pen = 0.0
         running_rep_pen = 0.0
         running_inv_pen = 0.0
+        running_spam = 0.0
+        running_entropy = 0.0
         time_loss = 0.0
         time_reward = 0.0
         time_adv = 0.0
@@ -338,6 +298,8 @@ def main(args):
         time_len_pen = 0.0
         time_rep_pen = 0.0
         time_inv_pen = 0.0
+        time_spam = 0.0
+        time_entropy = 0.0
         time_steps = 0
         step_in_epoch = 0
         last_step = skip_steps
@@ -348,13 +310,37 @@ def main(args):
             resid = resid.to(device, non_blocking=True)
             tgt_emb = tgt_emb.to(device, non_blocking=True)
 
-            logits, len_logits = model(codes, resid, ctx=None)
-
-            samp_len, samp_len_logp = sample_lengths(len_logits)
-            samp_tokens, samp_token_logp = sample_tokens(logits, args.temperature)
-
-            greedy_len, _ = greedy_lengths(len_logits)
-            greedy_tokens_ids, _ = greedy_tokens(logits)
+            (
+                samp_tokens,
+                samp_len,
+                logits,
+                _,
+                samp_token_logp,
+                samp_len_logp,
+            ) = model.generate(
+                codes,
+                resid,
+                ctx=None,
+                sample=True,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                ban_repeats=not args.no_ban_repeats,
+                min_len_bytes=args.min_len_bytes,
+                force_min_len=True,
+                return_logp=True,
+            )
+            with torch.no_grad():
+                greedy_tokens_ids, greedy_len, _, _ = model.generate(
+                    codes,
+                    resid,
+                    ctx=None,
+                    sample=False,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    ban_repeats=not args.no_ban_repeats,
+                    min_len_bytes=args.min_len_bytes,
+                    force_min_len=True,
+                )
 
             samp_tokens_list = decode_batch(samp_tokens, samp_len)
             greedy_tokens_list = decode_batch(greedy_tokens_ids, greedy_len)
@@ -369,32 +355,33 @@ def main(args):
                 samp_emb = encoder(samp_ids)
                 greedy_emb = encoder(greedy_ids)
 
-            samp_reward = cosine_reward(samp_emb, tgt_emb)
-            greedy_reward = cosine_reward(greedy_emb, tgt_emb)
-
-            samp_qmask, samp_qvals = quality_override(
-                samp_tokens_list, args.min_len_bytes
+            samp_reward, samp_comp = reward(
+                samp_emb,
+                tgt_emb,
+                samp_tokens_list,
+                samp_len,
+                args.max_len,
+                args.alpha_len,
+                args.beta_rep,
+                args.invalid_penalty,
+                min_len_bytes=args.min_len_bytes,
             )
-            greedy_qmask, greedy_qvals = quality_override(
-                greedy_tokens_list, args.min_len_bytes
-            )
-            samp_reward = torch.where(
-                samp_qmask.to(device), samp_qvals.to(device), samp_reward
-            )
-            greedy_reward = torch.where(
-                greedy_qmask.to(device), greedy_qvals.to(device), greedy_reward
+            greedy_reward, _ = reward(
+                greedy_emb,
+                tgt_emb,
+                greedy_tokens_list,
+                greedy_len,
+                args.max_len,
+                args.alpha_len,
+                args.beta_rep,
+                args.invalid_penalty,
+                min_len_bytes=args.min_len_bytes,
             )
 
-            samp_len_pen = length_penalty(samp_len, args.alpha_len, args.max_len)
-            samp_rep_pen = batch_repetition_penalty(samp_tokens_list).to(device) * args.beta_rep
-            samp_inv_pen = utf8_invalid_penalty(samp_tokens_list, args.invalid_penalty).to(device)
-
-            greedy_len_pen = length_penalty(greedy_len, args.alpha_len, args.max_len)
-            greedy_rep_pen = batch_repetition_penalty(greedy_tokens_list).to(device) * args.beta_rep
-            greedy_inv_pen = utf8_invalid_penalty(greedy_tokens_list, args.invalid_penalty).to(device)
-
-            samp_reward = samp_reward - samp_len_pen - samp_rep_pen - samp_inv_pen
-            greedy_reward = greedy_reward - greedy_len_pen - greedy_rep_pen - greedy_inv_pen
+            samp_len_pen = samp_comp["len_pen"]
+            samp_rep_pen = samp_comp["rep_pen"]
+            samp_inv_pen = samp_comp["inv_pen"]
+            samp_spam = samp_comp["spam"]
 
             adv = (samp_reward - greedy_reward).clamp(
                 min=-args.adv_clip, max=args.adv_clip
@@ -409,6 +396,13 @@ def main(args):
             logp = token_logp + samp_len_logp
 
             loss = -(adv.detach() * logp).mean()
+
+            if args.alpha_entropy > 0:
+                probs = F.softmax(logits, dim=-1).mean(dim=1)
+                entropy = -(probs * (probs + 1e-9).log()).sum(dim=-1).mean()
+                loss = loss - args.alpha_entropy * entropy
+            else:
+                entropy = None
 
             if args.entropy_bonus > 0:
                 probs = F.softmax(logits, dim=-1)
@@ -425,6 +419,8 @@ def main(args):
             mean_len_pen = float(samp_len_pen.mean())
             mean_rep_pen = float(samp_rep_pen.mean())
             mean_inv_pen = float(samp_inv_pen.mean())
+            mean_spam = float(samp_spam.mean())
+            mean_entropy = float(entropy) if entropy is not None else 0.0
             pbar.set_postfix(loss=float(loss.detach()), reward=mean_reward)
             running_loss += float(loss.detach())
             running_reward += mean_reward
@@ -433,6 +429,8 @@ def main(args):
             running_len_pen += mean_len_pen
             running_rep_pen += mean_rep_pen
             running_inv_pen += mean_inv_pen
+            running_spam += mean_spam
+            running_entropy += mean_entropy
             time_loss += float(loss.detach())
             time_reward += mean_reward
             time_adv += mean_adv
@@ -440,6 +438,8 @@ def main(args):
             time_len_pen += mean_len_pen
             time_rep_pen += mean_rep_pen
             time_inv_pen += mean_inv_pen
+            time_spam += mean_spam
+            time_entropy += mean_entropy
             time_steps += 1
             global_step += 1
             if args.save_every > 0 and global_step % args.save_every == 0:
@@ -474,7 +474,7 @@ def main(args):
                 step_time = now - last_log
                 rate = (args.log_every / step_time) if step_time > 0 else 0.0
                 logger.info(
-                    "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f",
+                    "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f spam=%.4f entropy=%.4f",
                     epoch,
                     step,
                     len(loader),
@@ -486,6 +486,8 @@ def main(args):
                     running_len_pen / args.log_every,
                     running_rep_pen / args.log_every,
                     running_inv_pen / args.log_every,
+                    running_spam / args.log_every,
+                    running_entropy / args.log_every,
                 )
                 if samp_tokens_list:
                     sample_text = bytes_to_text(samp_tokens_list[0])
@@ -507,6 +509,8 @@ def main(args):
                 running_len_pen = 0.0
                 running_rep_pen = 0.0
                 running_inv_pen = 0.0
+                running_spam = 0.0
+                running_entropy = 0.0
                 last_log = now
             if args.log_time_every > 0:
                 now = time.time()
@@ -514,7 +518,7 @@ def main(args):
                     rate = (time_steps / (now - last_time_log)) if time_steps > 0 else 0.0
                     denom = max(1, time_steps)
                     logger.info(
-                        "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f",
+                        "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f spam=%.4f entropy=%.4f",
                         epoch,
                         step,
                         len(loader),
@@ -526,6 +530,8 @@ def main(args):
                         time_len_pen / denom,
                         time_rep_pen / denom,
                         time_inv_pen / denom,
+                        time_spam / denom,
+                        time_entropy / denom,
                     )
                     time_loss = 0.0
                     time_reward = 0.0
@@ -534,6 +540,8 @@ def main(args):
                     time_len_pen = 0.0
                     time_rep_pen = 0.0
                     time_inv_pen = 0.0
+                    time_spam = 0.0
+                    time_entropy = 0.0
                     time_steps = 0
                     last_time_log = now
         if last_step > skip_steps:
@@ -590,13 +598,20 @@ if __name__ == "__main__":
         help="checkpoint path, 'auto' for latest renderer_step_*.pt or renderer_latest.pt, or 'none'",
     )
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--temperature", type=float, default=1.1)
+    ap.add_argument("--top_k", type=int, default=0)
+    ap.add_argument(
+        "--no_ban_repeats",
+        action="store_true",
+        help="disable simple anti-run penalty while sampling",
+    )
     ap.add_argument("--alpha_len", type=float, default=0.05)
     ap.add_argument("--beta_rep", type=float, default=0.1)
     ap.add_argument("--invalid_penalty", type=float, default=0.5)
     ap.add_argument("--min_len_bytes", type=int, default=32)
     ap.add_argument("--adv_clip", type=float, default=1.0)
     ap.add_argument("--entropy_bonus", type=float, default=0.0)
+    ap.add_argument("--alpha_entropy", type=float, default=0.01)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

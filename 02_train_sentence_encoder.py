@@ -121,6 +121,7 @@ def main(args):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     step = 0
+    collapse_hits = 0
     model.train()
     stop_training = False
     for epoch in range(args.epochs):
@@ -137,6 +138,39 @@ def main(args):
             opt.step()
             step += 1
             pbar.set_postfix(loss=float(loss.detach()))
+            if args.log_every > 0 and step % args.log_every == 0:
+                with torch.no_grad():
+                    emb = torch.cat([ctx_emb, nxt_emb], dim=0)
+                    emb_std = float(emb.std(dim=0).mean())
+                    n = emb.size(0)
+                    avg_cos = 0.0
+                    if n >= 2:
+                        k = min(8, n // 2)
+                        idx_i = torch.randint(0, n, (k,), device=emb.device)
+                        idx_j = torch.randint(0, n, (k,), device=emb.device)
+                        emb_i = emb[idx_i]
+                        emb_j = emb[idx_j]
+                        emb_i = nn.functional.normalize(emb_i, dim=-1)
+                        emb_j = nn.functional.normalize(emb_j, dim=-1)
+                        avg_cos = float((emb_i * emb_j).sum(dim=-1).mean())
+                logger.info(
+                    "train_stats step=%d loss=%.4f emb_std=%.6f avg_cos=%.4f",
+                    step,
+                    float(loss.detach()),
+                    emb_std,
+                    avg_cos,
+                )
+                if emb_std < 1e-4 or avg_cos > 0.99:
+                    collapse_hits += 1
+                else:
+                    collapse_hits = 0
+                if collapse_hits >= 3:
+                    logger.warning(
+                        "encoder collapse: step=%d emb_std=%.6f avg_cos=%.4f",
+                        step,
+                        emb_std,
+                        avg_cos,
+                    )
             if args.steps and step >= args.steps:
                 stop_training = True
                 break
@@ -186,6 +220,7 @@ if __name__ == "__main__":
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--steps", type=int, default=0)
+    ap.add_argument("--log_every", type=int, default=200)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--tau", type=float, default=0.07)
     ap.add_argument("--grad_clip", type=float, default=1.0)

@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 
 import torch
-from torch.nn import functional as F
 
 from tools.data import BYTE_EOS, BYTE_PAD, BYTE_VOCAB_SIZE, bytes_to_text
 from tools.encoder import ByteEncoder
@@ -11,31 +10,6 @@ from tools.planner import Planner
 from tools.renderer import Renderer
 from tools.rvq import load_rvq
 from utils import setup_runtime, split_sentences
-
-
-def sample_lengths(len_logits):
-    logits = len_logits[:, 1:]
-    probs = F.softmax(logits, dim=-1)
-    lengths = torch.multinomial(probs, num_samples=1).squeeze(1) + 1
-    return lengths
-
-
-def greedy_lengths(len_logits):
-    logits = len_logits[:, 1:]
-    return logits.argmax(dim=-1) + 1
-
-
-def sample_tokens(logits, temperature: float):
-    if temperature != 1.0:
-        logits = logits / temperature
-    probs = F.softmax(logits, dim=-1)
-    tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1)
-    tokens = tokens.view(probs.size(0), probs.size(1))
-    return tokens
-
-
-def greedy_tokens(logits):
-    return logits.argmax(dim=-1)
 
 
 def main(args):
@@ -117,13 +91,16 @@ def encoder_input_ids(text: str, max_len: int, device):
 
 def render_sentence(renderer, codes, resid, args):
     with torch.no_grad():
-        logits, len_logits = renderer(codes.unsqueeze(0), resid.unsqueeze(0), ctx=None)
-        if args.sample:
-            lengths = sample_lengths(len_logits)
-            tokens = sample_tokens(logits, args.temperature)
-        else:
-            lengths = greedy_lengths(len_logits)
-            tokens = greedy_tokens(logits)
+        tokens, lengths, _, _ = renderer.generate(
+            codes.unsqueeze(0),
+            resid.unsqueeze(0),
+            ctx=None,
+            sample=args.sample,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            ban_repeats=args.ban_repeats,
+            min_len_bytes=args.min_len_bytes,
+        )
         row = tokens[0, : lengths.item()].tolist()
         text = bytes_to_text([t for t in row if 0 <= t < 256])
     return text.strip()
@@ -139,7 +116,16 @@ if __name__ == "__main__":
     ap.add_argument("--renderer", default="out/renderer.pt")
     ap.add_argument("--out", default="out/gen.txt")
     ap.add_argument("--sample", action="store_true")
-    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--temperature", type=float, default=0.9)
+    ap.add_argument("--top_k", type=int, default=0)
+    ap.add_argument(
+        "--no-ban-repeats",
+        dest="ban_repeats",
+        action="store_false",
+        help="disable simple anti-run penalty while sampling",
+    )
+    ap.set_defaults(ban_repeats=True)
+    ap.add_argument("--min_len_bytes", type=int, default=32)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()
