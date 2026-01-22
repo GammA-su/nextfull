@@ -5,6 +5,13 @@ from typing import List, Tuple
 import torch
 from torch.nn import functional as F
 
+DOM_BYTE_RATIO_THRESH = 0.60
+RUN_MAX_THRESH = 16
+RUN_MAX_PENALTY_SCALE = 10.0
+NONPRINT_RATIO_THRESH = 0.85
+NONPRINT_PENALTY_WEIGHT = 2.0
+WHITESPACE_BYTES = {0x20, 0x0A, 0x09}
+
 
 def cosine_reward(gen_emb: torch.Tensor, tgt_emb: torch.Tensor):
     gen = F.normalize(gen_emb, dim=-1)
@@ -60,6 +67,93 @@ def utf8_invalid_penalty(batch_tokens: List[List[int]], penalty: float):
         except UnicodeDecodeError:
             out.append(penalty)
     return torch.tensor(out, dtype=torch.float32)
+
+
+def printable_ratio_from_bytes(data: bytes) -> float:
+    if not data:
+        return 0.0
+    printable = sum(1 for b in data if (0x20 <= b <= 0x7E) or b == 0x0A)
+    return printable / float(len(data))
+
+
+def printable_ratio(tokens: List[int], text: str = None) -> float:
+    data = bytes([t for t in tokens if 0 <= t < 256])
+    if data:
+        return printable_ratio_from_bytes(data)
+    if text is None:
+        return 0.0
+    repl = text.encode("utf-8", errors="replace")
+    return printable_ratio_from_bytes(repl)
+
+
+def batch_printable_penalty(
+    batch_tokens: List[List[int]],
+    min_len_bytes: int,
+    threshold: float = NONPRINT_RATIO_THRESH,
+    weight: float = NONPRINT_PENALTY_WEIGHT,
+):
+    ratios = []
+    penalties = []
+    for tokens in batch_tokens:
+        data = bytes([t for t in tokens if 0 <= t < 256])
+        ratio = printable_ratio_from_bytes(data)
+        ratios.append(ratio)
+        if len(data) >= min_len_bytes and ratio < threshold:
+            penalties.append((threshold - ratio) * weight)
+        else:
+            penalties.append(0.0)
+    return (
+        torch.tensor(ratios, dtype=torch.float32),
+        torch.tensor(penalties, dtype=torch.float32),
+    )
+
+
+def dominant_byte_ratio(data: bytes) -> float:
+    if not data:
+        return 0.0
+    filtered = bytes(b for b in data if b not in WHITESPACE_BYTES)
+    if not filtered:
+        return 0.0
+    counts = Counter(filtered)
+    return max(counts.values()) / float(len(filtered))
+
+
+def max_run_length_bytes(data: bytes) -> int:
+    if not data:
+        return 0
+    max_run = 0
+    run = 0
+    prev = None
+    for b in data:
+        if prev is not None and b == prev:
+            run += 1
+        else:
+            prev = b
+            run = 1
+        if run > max_run:
+            max_run = run
+    return max_run
+
+
+def batch_run_penalty(
+    batch_tokens: List[List[int]],
+    threshold: int = RUN_MAX_THRESH,
+    scale: float = RUN_MAX_PENALTY_SCALE,
+):
+    run_maxes = []
+    penalties = []
+    for tokens in batch_tokens:
+        data = bytes([t for t in tokens if 0 <= t < 256])
+        run_max = max_run_length_bytes(data)
+        run_maxes.append(run_max)
+        if run_max >= threshold:
+            penalties.append((run_max - threshold) / float(scale))
+        else:
+            penalties.append(0.0)
+    return (
+        torch.tensor(run_maxes, dtype=torch.float32),
+        torch.tensor(penalties, dtype=torch.float32),
+    )
 
 
 def only_whitespace_or_punct(text: str) -> bool:
@@ -150,6 +244,18 @@ def quality_override(
             values.append(short_reward)
             spam.append(False)
             continue
+        ratio = printable_ratio(tokens, text=text)
+        if len(data) >= min_len_bytes and ratio < NONPRINT_RATIO_THRESH:
+            mask.append(True)
+            values.append(spam_reward)
+            spam.append(True)
+            continue
+        dom_ratio = dominant_byte_ratio(data)
+        if len(data) >= min_len_bytes and dom_ratio >= DOM_BYTE_RATIO_THRESH:
+            mask.append(True)
+            values.append(spam_reward)
+            spam.append(True)
+            continue
         if is_spammy(text, min_len_bytes=min_len_bytes):
             mask.append(True)
             values.append(spam_reward)
@@ -192,12 +298,30 @@ def compute_reward(
     rep_raw = batch_repetition_penalty(batch_tokens).to(cos.device)
     rep_pen = (rep_raw * beta_rep).clamp(max=3.0)
     inv_pen = utf8_invalid_penalty(batch_tokens, invalid_penalty).to(cos.device)
-    reward = base - len_pen - rep_pen - inv_pen
+    print_ratio, nonprint_pen = batch_printable_penalty(
+        batch_tokens, min_len_bytes=min_len_bytes
+    )
+    print_ratio = print_ratio.to(cos.device)
+    nonprint_pen = nonprint_pen.to(cos.device)
+    dom_ratio = torch.tensor(
+        [dominant_byte_ratio(bytes([t for t in tok if 0 <= t < 256])) for tok in batch_tokens],
+        dtype=torch.float32,
+        device=cos.device,
+    )
+    run_max, run_pen = batch_run_penalty(batch_tokens)
+    run_max = run_max.to(cos.device)
+    run_pen = run_pen.to(cos.device)
+    reward = base - len_pen - rep_pen - inv_pen - nonprint_pen - run_pen
     return reward, {
         "cosine": cos,
         "len_pen": len_pen,
         "rep_pen": rep_pen,
         "inv_pen": inv_pen,
+        "print_ratio": print_ratio,
+        "nonprint_pen": nonprint_pen,
+        "dom_ratio": dom_ratio,
+        "run_max": run_max,
+        "run_pen": run_pen,
         "qmask": qmask,
         "qvals": qvals,
         "spam": spam.float(),

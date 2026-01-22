@@ -1,4 +1,6 @@
 import math
+import warnings
+
 import torch
 from torch import nn
 
@@ -70,15 +72,24 @@ class Renderer(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
         ban_repeats: bool = True,
+        ascii_only: bool = True,
         min_len_bytes: int = 32,
         force_min_len: bool = False,
         return_logp: bool = False,
     ):
         logits, len_logits = self.forward(codes, resid, ctx=ctx)
+        if ascii_only:
+            allowed = torch.zeros(256, dtype=torch.bool, device=logits.device)
+            allowed[0x20:0x7F] = True
+            allowed[0x0A] = True
+            allowed_mask = allowed
+        else:
+            allowed_mask = None
         length_logits = len_logits[:, 1:]
-        min_len = max(1, min_len_bytes)
+        min_len = max(0, min_len_bytes)
         if min_len > self.max_len:
             min_len = self.max_len
+        enforce_min_len = min_len > 0
         if min_len > 1:
             length_mask = torch.arange(1, self.max_len + 1, device=length_logits.device)
             length_logits = length_logits.masked_fill(
@@ -87,7 +98,7 @@ class Renderer(nn.Module):
         if sample:
             length_probs = torch.softmax(length_logits, dim=-1)
             lengths = torch.multinomial(length_probs, num_samples=1).squeeze(1) + 1
-            if force_min_len:
+            if enforce_min_len or force_min_len:
                 lengths = lengths.clamp_min(min_len)
             len_logp = torch.log(
                 torch.gather(length_probs, 1, (lengths - 1).unsqueeze(1)).squeeze(1) + 1e-8
@@ -103,17 +114,24 @@ class Renderer(nn.Module):
             prev = None
             penalty_tokens = None
             special_tokens = [BYTE_EOS]
-            if force_min_len:
+            if enforce_min_len or force_min_len:
                 special_tokens.extend([BYTE_PAD, BYTE_BOS])
             for i in range(token_logits.size(1)):
                 step_logits = token_logits[:, i, :]
+                if allowed_mask is not None:
+                    step_logits = step_logits.clone()
+                    step_logits[:, :256] = step_logits[:, :256].masked_fill(
+                        ~allowed_mask, -1e9
+                    )
                 if BYTE_EOS < self.vocab_size and i < min_len:
                     step_logits = step_logits.clone()
                     step_logits[:, BYTE_EOS] = -1e9
-                if force_min_len:
+                if enforce_min_len or force_min_len:
                     active = i < lengths
                     if active.any():
                         step_logits = step_logits.clone()
+                        if self.vocab_size > 256 and i < min_len:
+                            step_logits[active, 256:] = -1e9
                         for token in special_tokens:
                             if token < self.vocab_size:
                                 step_logits[active, token] = -1e9
@@ -147,7 +165,7 @@ class Renderer(nn.Module):
                             step_tokens == prev, step_tokens, torch.full_like(step_tokens, -1)
                         )
                     prev = step_tokens
-            if force_min_len and BYTE_PAD < self.vocab_size:
+            if (enforce_min_len or force_min_len) and BYTE_PAD < self.vocab_size:
                 pad_mask = torch.arange(tokens.size(1), device=tokens.device)
                 pad_mask = pad_mask.unsqueeze(0) >= lengths.unsqueeze(1)
                 tokens = tokens.masked_fill(pad_mask, BYTE_PAD)
@@ -155,26 +173,87 @@ class Renderer(nn.Module):
                 token_logp = torch.stack(token_logp_steps, dim=1)
         else:
             lengths = length_logits.argmax(dim=-1) + 1
-            if force_min_len:
+            if enforce_min_len or force_min_len:
                 lengths = lengths.clamp_min(min_len)
             token_logits = logits
+            if allowed_mask is not None:
+                token_logits = token_logits.clone()
+                token_logits[:, :, :256] = token_logits[:, :, :256].masked_fill(
+                    ~allowed_mask, -1e9
+                )
             if BYTE_EOS < self.vocab_size and min_len > 1:
                 token_logits = token_logits.clone()
                 token_logits[:, :min_len, BYTE_EOS] = -1e9
-            if force_min_len:
+            if enforce_min_len or force_min_len:
                 pos_mask = torch.arange(token_logits.size(1), device=token_logits.device)
                 pos_mask = pos_mask.unsqueeze(0) < lengths.unsqueeze(1)
                 idx_b, idx_t = pos_mask.nonzero(as_tuple=True)
                 for token in (BYTE_EOS, BYTE_PAD, BYTE_BOS):
                     if token < self.vocab_size and idx_b.numel() > 0:
                         token_logits[idx_b, idx_t, token] = -1e9
+                if self.vocab_size > 256 and min_len > 0 and idx_b.numel() > 0:
+                    token_logits[idx_b, idx_t, 256:] = -1e9
             tokens = token_logits.argmax(dim=-1)
-            if force_min_len and BYTE_PAD < self.vocab_size:
+            if (enforce_min_len or force_min_len) and BYTE_PAD < self.vocab_size:
                 pad_mask = torch.arange(tokens.size(1), device=tokens.device)
                 pad_mask = pad_mask.unsqueeze(0) >= lengths.unsqueeze(1)
                 tokens = tokens.masked_fill(pad_mask, BYTE_PAD)
             token_logp = None
             len_logp = None
+        byte_counts = (tokens < 256).sum(dim=1)
+        if (byte_counts == 0).any():
+            fallback_len = max(min_len, 1)
+            fallback_len = min(fallback_len, tokens.size(1))
+            warnings.warn("renderer.generate: empty bytes; applying fallback sampling")
+            bad = (byte_counts == 0).nonzero(as_tuple=True)[0]
+            if return_logp and sample:
+                if token_logp is None:
+                    token_logp = torch.zeros(
+                        tokens.size(0),
+                        tokens.size(1),
+                        dtype=logits.dtype,
+                        device=logits.device,
+                    )
+            for b in bad.tolist():
+                prev = None
+                for i in range(fallback_len):
+                    step_logits = logits[b, i, :256]
+                    if allowed_mask is not None:
+                        step_logits = step_logits.masked_fill(~allowed_mask, -1e9)
+                    if temperature != 1.0:
+                        step_logits = step_logits / temperature
+                    if ban_repeats and prev is not None:
+                        step_logits = step_logits.clone()
+                        step_logits[prev] -= 1.0
+                    if top_k and top_k > 0:
+                        k = min(top_k, step_logits.size(-1))
+                        topk_vals, _ = torch.topk(step_logits, k=k, dim=-1)
+                        kth = topk_vals[-1]
+                        step_logits = torch.where(
+                            step_logits < kth,
+                            torch.full_like(step_logits, -1e9),
+                            step_logits,
+                        )
+                    step_probs = torch.softmax(step_logits, dim=-1)
+                    token = torch.multinomial(step_probs, num_samples=1).squeeze(0)
+                    tokens[b, i] = token
+                    if return_logp and sample:
+                        token_logp[b, i] = torch.log(step_probs[token] + 1e-8)
+                    prev = int(token.item())
+                if BYTE_PAD < self.vocab_size:
+                    tokens[b, fallback_len:] = BYTE_PAD
+                lengths[b] = max(int(lengths[b].item()), fallback_len)
+            byte_counts = (tokens < 256).sum(dim=1)
+            still_empty = (byte_counts == 0).nonzero(as_tuple=True)[0]
+            if still_empty.numel() > 0:
+                warnings.warn("renderer.generate: empty after fallback; using spaces")
+                fill_len = max(min_len, 1)
+                fill_len = min(fill_len, tokens.size(1))
+                for b in still_empty.tolist():
+                    tokens[b, :fill_len] = 32
+                    if BYTE_PAD < self.vocab_size:
+                        tokens[b, fill_len:] = BYTE_PAD
+                    lengths[b] = max(int(lengths[b].item()), fill_len)
         if return_logp:
             return tokens, lengths, logits, len_logits, token_logp, len_logp
         return tokens, lengths, logits, len_logits

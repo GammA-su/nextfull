@@ -24,7 +24,7 @@ def bytes_to_text(byte_ids):
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
-        return data.decode("utf-8", errors="ignore")
+        return data.decode("utf-8", errors="replace")
 
 
 def tokens_to_bytes(token_ids):
