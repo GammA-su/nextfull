@@ -10,7 +10,9 @@ RUN_MAX_THRESH = 16
 RUN_MAX_PENALTY_SCALE = 10.0
 NONPRINT_RATIO_THRESH = 0.85
 NONPRINT_PENALTY_WEIGHT = 2.0
-WHITESPACE_BYTES = {0x20, 0x0A, 0x09}
+WHITESPACE_BYTES = {0x20, 0x0A, 0x09, 0x0D}
+WS_RATIO_THRESH = 0.95
+WS_MIN_NONWS = 4
 
 
 def cosine_reward(gen_emb: torch.Tensor, tgt_emb: torch.Tensor):
@@ -111,11 +113,8 @@ def batch_printable_penalty(
 def dominant_byte_ratio(data: bytes) -> float:
     if not data:
         return 0.0
-    filtered = bytes(b for b in data if b not in WHITESPACE_BYTES)
-    if not filtered:
-        return 0.0
-    counts = Counter(filtered)
-    return max(counts.values()) / float(len(filtered))
+    counts = Counter(data)
+    return max(counts.values()) / float(len(data))
 
 
 def max_run_length_bytes(data: bytes) -> int:
@@ -250,6 +249,13 @@ def quality_override(
             values.append(spam_reward)
             spam.append(True)
             continue
+        non_ws_len = sum(1 for b in data if b not in WHITESPACE_BYTES)
+        ws_ratio = 1.0 - (non_ws_len / float(len(data))) if data else 1.0
+        if len(data) >= min_len_bytes and non_ws_len < max(WS_MIN_NONWS, int(0.05 * len(data))):
+            mask.append(True)
+            values.append(spam_reward)
+            spam.append(True)
+            continue
         dom_ratio = dominant_byte_ratio(data)
         if len(data) >= min_len_bytes and dom_ratio >= DOM_BYTE_RATIO_THRESH:
             mask.append(True)
@@ -308,6 +314,21 @@ def compute_reward(
         dtype=torch.float32,
         device=cos.device,
     )
+    data_lens = torch.tensor(
+        [len(bytes([t for t in tok if 0 <= t < 256])) for tok in batch_tokens],
+        dtype=torch.float32,
+        device=cos.device,
+    )
+    non_ws_len = torch.tensor(
+        [sum(1 for b in bytes([t for t in tok if 0 <= t < 256]) if b not in WHITESPACE_BYTES) for tok in batch_tokens],
+        dtype=torch.float32,
+        device=cos.device,
+    )
+    ws_ratio = torch.where(
+        data_lens.clamp(min=1.0) > 0,
+        1.0 - (non_ws_len / data_lens.clamp(min=1.0)),
+        torch.zeros_like(non_ws_len),
+    )
     run_max, run_pen = batch_run_penalty(batch_tokens)
     run_max = run_max.to(cos.device)
     run_pen = run_pen.to(cos.device)
@@ -322,6 +343,8 @@ def compute_reward(
         "dom_ratio": dom_ratio,
         "run_max": run_max,
         "run_pen": run_pen,
+        "ws_ratio": ws_ratio,
+        "non_ws_len": non_ws_len,
         "qmask": qmask,
         "qvals": qvals,
         "spam": spam.float(),

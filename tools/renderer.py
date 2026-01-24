@@ -36,6 +36,7 @@ class Renderer(nn.Module):
         self.resid_proj = nn.Linear(d_resid, d_model)
         self.ctx_proj = nn.Linear(d_ctx, d_model) if d_ctx > 0 else None
         self.pos_emb = nn.Parameter(torch.randn(max_len, d_model) / math.sqrt(d_model))
+        self.byte_emb = nn.Embedding(vocab_size, d_model)
 
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -62,6 +63,48 @@ class Renderer(nn.Module):
         pooled = h.mean(dim=1)
         len_logits = self.len_head(pooled)
         return logits, len_logits
+
+    def forward_teacher(
+        self,
+        codes: torch.Tensor,
+        resid: torch.Tensor,
+        prompt_bytes: torch.Tensor,
+        target_bytes: torch.Tensor,
+        ascii_only: bool = True,
+        ctx: torch.Tensor = None,
+    ) -> torch.Tensor:
+        cond = self.resid_proj(resid)
+        for k in range(self.K):
+            cond = cond + self.code_embeds[k](codes[:, k])
+        if ctx is not None and self.ctx_proj is not None:
+            cond = cond + self.ctx_proj(ctx)
+
+        if prompt_bytes is None:
+            prompt_bytes = target_bytes[:, :0]
+        bsz, lt = target_bytes.shape
+        bos = torch.full((bsz, 1), BYTE_BOS, dtype=target_bytes.dtype, device=target_bytes.device)
+        if lt > 1:
+            prefix = torch.cat([bos, target_bytes[:, :-1]], dim=1)
+        else:
+            prefix = bos
+        tokens = torch.cat([prompt_bytes, prefix], dim=1)
+        if tokens.size(1) > self.max_len:
+            tokens = tokens[:, -self.max_len :]
+        seq_len = tokens.size(1)
+        pos = self.pos_emb[:seq_len].unsqueeze(0)
+        x = self.byte_emb(tokens) + pos + cond.unsqueeze(1)
+        h = self.transformer(x)
+        logits = self.out(h)
+        if logits.size(1) >= lt:
+            logits = logits[:, -lt:, :256]
+        else:
+            logits = logits[:, :, :256]
+        if ascii_only:
+            allowed = torch.zeros(256, dtype=torch.bool, device=logits.device)
+            allowed[0x20:0x7F] = True
+            allowed[0x0A] = True
+            logits = logits.masked_fill(~allowed, -1e9)
+        return logits
 
     def generate(
         self,
@@ -132,6 +175,8 @@ class Renderer(nn.Module):
                         step_logits = step_logits.clone()
                         if self.vocab_size > 256 and i < min_len:
                             step_logits[active, 256:] = -1e9
+                        if i < min_len and 0x20 < self.vocab_size:
+                            step_logits[active, 0x20] = -1e9
                         for token in special_tokens:
                             if token < self.vocab_size:
                                 step_logits[active, token] = -1e9
@@ -193,6 +238,8 @@ class Renderer(nn.Module):
                         token_logits[idx_b, idx_t, token] = -1e9
                 if self.vocab_size > 256 and min_len > 0 and idx_b.numel() > 0:
                     token_logits[idx_b, idx_t, 256:] = -1e9
+                if min_len > 0 and idx_b.numel() > 0 and 0x20 < self.vocab_size:
+                    token_logits[idx_b, idx_t, 0x20] = -1e9
             tokens = token_logits.argmax(dim=-1)
             if (enforce_min_len or force_min_len) and BYTE_PAD < self.vocab_size:
                 pad_mask = torch.arange(tokens.size(1), device=tokens.device)
@@ -220,6 +267,9 @@ class Renderer(nn.Module):
                     step_logits = logits[b, i, :256]
                     if allowed_mask is not None:
                         step_logits = step_logits.masked_fill(~allowed_mask, -1e9)
+                    if i < min_len:
+                        step_logits = step_logits.clone()
+                        step_logits[0x20] = -1e9
                     if temperature != 1.0:
                         step_logits = step_logits / temperature
                     if ban_repeats and prev is not None:

@@ -293,7 +293,9 @@ def main(args):
         running_entropy = 0.0
         running_print_ratio = 0.0
         running_nonprint_pen = 0.0
-        running_imitation = 0.0
+        running_teacher = 0.0
+        running_dom_ratio = 0.0
+        running_run_max = 0.0
         time_loss = 0.0
         time_reward = 0.0
         time_adv = 0.0
@@ -305,7 +307,9 @@ def main(args):
         time_entropy = 0.0
         time_print_ratio = 0.0
         time_nonprint_pen = 0.0
-        time_imitation = 0.0
+        time_teacher = 0.0
+        time_dom_ratio = 0.0
+        time_run_max = 0.0
         time_steps = 0
         step_in_epoch = 0
         last_step = skip_steps
@@ -394,6 +398,8 @@ def main(args):
             samp_spam = samp_comp["spam"]
             samp_print_ratio = samp_comp["print_ratio"]
             samp_nonprint_pen = samp_comp["nonprint_pen"]
+            samp_dom_ratio = samp_comp.get("dom_ratio")
+            samp_run_max = samp_comp.get("run_max")
 
             adv = (samp_reward - greedy_reward).clamp(
                 min=-args.adv_clip, max=args.adv_clip
@@ -416,33 +422,38 @@ def main(args):
             else:
                 entropy = None
 
-            if args.alpha_imitation > 0:
+            if args.alpha_teacher > 0:
                 imax = args.imitation_max_bytes
                 if imax is None:
                     imax = args.min_len_bytes
-                imax = min(int(imax), logits.size(1))
+                teacher_logits = model.forward_teacher(
+                    codes,
+                    resid,
+                    tgt_bytes[:, :0],
+                    tgt_bytes,
+                    ascii_only=True,
+                )
+                imax = min(int(imax), teacher_logits.size(1))
                 if imax > 0:
-                    logits_bytes = logits[:, :imax, :256]
+                    logits_bytes = teacher_logits[:, :imax, :]
+                    target = tgt_bytes[:, :imax].clamp(min=0, max=255)
                     allowed = torch.zeros(256, dtype=torch.bool, device=logits_bytes.device)
                     allowed[0x20:0x7F] = True
                     allowed[0x0A] = True
-                    logits_bytes = logits_bytes.masked_fill(~allowed, -1e9)
-                    target = tgt_bytes[:, :imax]
-                    mask = target < 256
-                    mask = mask & allowed[target.clamp(min=0, max=255)]
+                    mask = (tgt_bytes[:, :imax] < 256) & allowed[target]
                     if mask.any():
                         flat_logits = logits_bytes.reshape(-1, 256)
-                        flat_target = target.reshape(-1).clamp(min=0, max=255)
+                        flat_target = target.reshape(-1)
                         flat_mask = mask.reshape(-1)
                         ce = F.cross_entropy(flat_logits, flat_target, reduction="none")
-                        imitation_ce = (ce * flat_mask.float()).sum() / flat_mask.float().sum().clamp(min=1.0)
+                        teacher_ce = (ce * flat_mask.float()).sum() / flat_mask.float().sum().clamp(min=1.0)
                     else:
-                        imitation_ce = torch.tensor(0.0, device=logits.device)
+                        teacher_ce = torch.tensor(0.0, device=logits.device)
                 else:
-                    imitation_ce = torch.tensor(0.0, device=logits.device)
-                loss = loss + args.alpha_imitation * imitation_ce
+                    teacher_ce = torch.tensor(0.0, device=logits.device)
+                loss = loss + args.alpha_teacher * teacher_ce
             else:
-                imitation_ce = torch.tensor(0.0, device=logits.device)
+                teacher_ce = torch.tensor(0.0, device=logits.device)
 
             if args.entropy_bonus > 0:
                 probs = F.softmax(logits, dim=-1)
@@ -463,7 +474,9 @@ def main(args):
             mean_entropy = float(entropy) if entropy is not None else 0.0
             mean_print_ratio = float(samp_print_ratio.mean())
             mean_nonprint_pen = float(samp_nonprint_pen.mean())
-            mean_imitation = float(imitation_ce)
+            mean_teacher = float(teacher_ce)
+            mean_dom_ratio = float(samp_dom_ratio.mean()) if samp_dom_ratio is not None else 0.0
+            mean_run_max = float(samp_run_max.mean()) if samp_run_max is not None else 0.0
             pbar.set_postfix(loss=float(loss.detach()), reward=mean_reward)
             running_loss += float(loss.detach())
             running_reward += mean_reward
@@ -476,7 +489,9 @@ def main(args):
             running_entropy += mean_entropy
             running_print_ratio += mean_print_ratio
             running_nonprint_pen += mean_nonprint_pen
-            running_imitation += mean_imitation
+            running_teacher += mean_teacher
+            running_dom_ratio += mean_dom_ratio
+            running_run_max += mean_run_max
             time_loss += float(loss.detach())
             time_reward += mean_reward
             time_adv += mean_adv
@@ -488,7 +503,9 @@ def main(args):
             time_entropy += mean_entropy
             time_print_ratio += mean_print_ratio
             time_nonprint_pen += mean_nonprint_pen
-            time_imitation += mean_imitation
+            time_teacher += mean_teacher
+            time_dom_ratio += mean_dom_ratio
+            time_run_max += mean_run_max
             time_steps += 1
             global_step += 1
             if args.save_every > 0 and global_step % args.save_every == 0:
@@ -523,7 +540,7 @@ def main(args):
                 step_time = now - last_log
                 rate = (args.log_every / step_time) if step_time > 0 else 0.0
                 logger.info(
-                    "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f spam=%.4f entropy=%.4f print_ratio=%.4f nonprint_pen=%.4f imitation=%.4f",
+                    "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f spam=%.4f entropy=%.4f teacher=%.4f dom_ratio=%.4f run_max=%.1f",
                     epoch,
                     step,
                     len(loader),
@@ -537,9 +554,9 @@ def main(args):
                     running_inv_pen / args.log_every,
                     running_spam / args.log_every,
                     running_entropy / args.log_every,
-                    running_print_ratio / args.log_every,
-                    running_nonprint_pen / args.log_every,
-                    running_imitation / args.log_every,
+                    running_teacher / args.log_every,
+                    running_dom_ratio / args.log_every,
+                    running_run_max / args.log_every,
                 )
                 if samp_tokens_list:
                     sample_text = bytes_to_text(samp_tokens_list[0])
@@ -565,7 +582,9 @@ def main(args):
                 running_entropy = 0.0
                 running_print_ratio = 0.0
                 running_nonprint_pen = 0.0
-                running_imitation = 0.0
+                running_teacher = 0.0
+                running_dom_ratio = 0.0
+                running_run_max = 0.0
                 last_log = now
             if args.log_time_every > 0:
                 now = time.time()
@@ -573,7 +592,7 @@ def main(args):
                     rate = (time_steps / (now - last_time_log)) if time_steps > 0 else 0.0
                     denom = max(1, time_steps)
                     logger.info(
-                        "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f spam=%.4f entropy=%.4f print_ratio=%.4f nonprint_pen=%.4f imitation=%.4f",
+                        "epoch=%d step=%d/%d rate=%.2f steps/s loss=%.4f reward=%.4f adv=%.4f len=%.1f len_pen=%.4f rep_pen=%.4f inv_pen=%.4f spam=%.4f entropy=%.4f teacher=%.4f dom_ratio=%.4f run_max=%.1f",
                         epoch,
                         step,
                         len(loader),
@@ -587,9 +606,9 @@ def main(args):
                         time_inv_pen / denom,
                         time_spam / denom,
                         time_entropy / denom,
-                        time_print_ratio / denom,
-                        time_nonprint_pen / denom,
-                        time_imitation / denom,
+                        time_teacher / denom,
+                        time_dom_ratio / denom,
+                        time_run_max / denom,
                     )
                     time_loss = 0.0
                     time_reward = 0.0
@@ -602,7 +621,9 @@ def main(args):
                     time_entropy = 0.0
                     time_print_ratio = 0.0
                     time_nonprint_pen = 0.0
-                    time_imitation = 0.0
+                    time_teacher = 0.0
+                    time_dom_ratio = 0.0
+                    time_run_max = 0.0
                     time_steps = 0
                     last_time_log = now
         if last_step > skip_steps:
@@ -673,7 +694,7 @@ if __name__ == "__main__":
     ap.add_argument("--adv_clip", type=float, default=1.0)
     ap.add_argument("--entropy_bonus", type=float, default=0.0)
     ap.add_argument("--alpha_entropy", type=float, default=0.01)
-    ap.add_argument("--alpha_imitation", type=float, default=0.05)
+    ap.add_argument("--alpha_teacher", type=float, default=0.5)
     ap.add_argument(
         "--imitation_max_bytes",
         type=int,
